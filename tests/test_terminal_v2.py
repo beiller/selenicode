@@ -42,7 +42,7 @@ class TestRenderFrame(unittest.TestCase):
         self.assertEqual(len(rows), 10)
         status_text = "".join(seg[0] for seg in rows[8])
         self.assertIn("ready", status_text)
-        self.assertEqual(rows[8][0][1], t2.STY_DIM)
+        self.assertEqual(rows[8][0][1], t2.STY_STATUS)
         self.assertTrue(rows[9][0][0].startswith("> "))
 
     def test_few_lines_top_aligned(self):
@@ -234,22 +234,104 @@ class TestApplyEvent(unittest.TestCase):
         state = t2.UIState(context_size=100)
         t2.apply_event(state, Token("0", "assistant", "hi", True))
         self.assertEqual(state.active.raw, "hi")
-        # DEBUG: token updates are frozen while display issues are tracked down
         t2.apply_event(state, UsageReport("0", {"prompt_tokens": 10, "completion_tokens": 5}))
-        self.assertEqual(state.tokens, 0)
+        self.assertEqual(state.tokens, 15)
         state.busy = True
         t2.apply_event(state, TurnDone("m1"))
         self.assertFalse(state.busy)
+        self.assertEqual(state.status, "ready")
         self.assertIsNone(state.active)
         t2.apply_event(state, History([{"role": "user", "content": "old"}]))
         self.assertEqual(len(state.blocks), 2)
         self.assertEqual(state.blocks[-1].raw, "old")
 
-    def test_usage_frozen_while_debugging(self):
-        # DEBUG: token updates are frozen while display issues are tracked down
+    def test_usage_updates_token_count(self):
         state = t2.UIState()
         t2.apply_event(state, UsageReport("0", {"prompt_tokens": 7, "completion_tokens": 3}))
-        self.assertEqual(state.tokens, 0)
+        self.assertEqual(state.tokens, 10)
+
+    def test_status_bar_spinner_and_ready(self):
+        state = t2.UIState(context_size=100)
+        status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
+        self.assertEqual(status_line, "status: ready tokens: 0/100 (0%)")
+        state.busy = True
+        state.frame = 3
+        status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
+        self.assertEqual(status_line, f"status: {t2.SPINNER[3]} thinking tokens: 0/100 (0%)")
+
+    def test_status_bar_token_percentage(self):
+        state = t2.UIState(context_size=1600)
+        state.tokens = 400
+        status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
+        self.assertIn("tokens: 400/1600 (25%)", status_line)
+
+
+class TestSubmitMessage(unittest.TestCase):
+    def test_prompt_recorded_and_turn_started(self):
+        state = t2.UIState()
+        state.scroll_up = 5
+        t2.apply_token(state, "assistant", "old answer", True)
+        t2.submit_message(state, "my prompt")
+        self.assertTrue(state.busy)
+        self.assertEqual(state.scroll_up, 0)
+        block = state.blocks[-1]
+        self.assertEqual((block.role, block.prefix, block.raw, block.style), ("user", "You: ", "my prompt", t2.STY_YOU))
+        # the previous active block was finalized into scrollback first
+        self.assertEqual(state.blocks[0].raw, "old answer")
+        self.assertIsNone(state.active)
+
+    def test_matches_history_rendering(self):
+        live = t2.UIState()
+        t2.submit_message(live, "hello")
+        from_hist = t2.blocks_from_history([{"role": "user", "content": "hello"}])
+        a, b = live.blocks[-1], from_hist[0]
+        self.assertEqual((a.role, a.prefix, a.raw, a.style), (b.role, b.prefix, b.raw, b.style))
+
+
+class TestDecodeInput(unittest.TestCase):
+    def test_printable(self):
+        self.assertEqual(t2._decode_input(b"hello"), ([ord(c) for c in "hello"], b""))
+
+    def test_enter_backspace_ctrl(self):
+        self.assertEqual(t2._decode_input(b"\r"), ([t2.K_ENTER], b""))
+        self.assertEqual(t2._decode_input(b"\n"), ([t2.K_ENTER], b""))
+        self.assertEqual(t2._decode_input(b"\x7f"), ([t2.K_BACKSPACE], b""))
+        self.assertEqual(t2._decode_input(b"\x08"), ([t2.K_BACKSPACE], b""))
+        self.assertEqual(t2._decode_input(b"\x03"), ([t2.K_CTRL_C], b""))
+        self.assertEqual(t2._decode_input(b"\x11"), ([t2.K_CTRL_Q], b""))
+
+    def test_function_keys(self):
+        self.assertEqual(t2._decode_input(b"\x1b[A"), ([t2.K_UP], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[B"), ([t2.K_DOWN], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[C"), ([t2.K_RIGHT], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[D"), ([t2.K_LEFT], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[5~"), ([t2.K_PPAGE], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[6~"), ([t2.K_NPAGE], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[H"), ([t2.K_HOME], b""))
+        self.assertEqual(t2._decode_input(b"\x1b[F"), ([t2.K_END], b""))
+
+    def test_split_escape_held_back(self):
+        self.assertEqual(t2._decode_input(b"\x1b"), ([], b"\x1b"))
+        self.assertEqual(t2._decode_input(b"\x1b["), ([], b"\x1b["))
+        keys, rem = t2._decode_input(b"\x1b")
+        self.assertEqual(rem, b"\x1b")
+
+    def test_mouse_swallowed(self):
+        self.assertEqual(t2._decode_input(b"\x1b[<64;5;3M"), ([], b""))
+        self.assertEqual(t2._decode_input(b"\x1bM\x01\x02\x03"), ([], b""))
+
+    def test_unknown_csi_swallowed(self):
+        self.assertEqual(t2._decode_input(b"\x1b[99;99u"), ([], b""))
+
+    def test_mixed_stream(self):
+        keys, rem = t2._decode_input(b"a\x1b[Bb")
+        self.assertEqual(keys, [ord("a"), t2.K_DOWN, ord("b")])
+        self.assertEqual(rem, b"")
+
+    def test_trailing_partial_held_with_complete_before(self):
+        keys, rem = t2._decode_input(b"\x1b[A\x1b[5")
+        self.assertEqual(keys, [t2.K_UP])
+        self.assertEqual(rem, b"\x1b[5")
 
 
 if __name__ == "__main__":

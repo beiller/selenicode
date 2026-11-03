@@ -7,7 +7,7 @@ as dozens.
 
 Layout (H x W):
     rows 0 .. H-3   scrollback viewport (window into all message lines)
-    row   H-2       status bar (dim): spinner/state + token usage
+    row   H-2       status bar (bold green): spinner/state + token usage
     row   H-1       prompt line: "> " + input + cursor
 
 Keys: Enter submit, Backspace/Left/Right edit, PgUp/PgDn/Home/End/wheel scroll,
@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import pathlib
-import select
 import struct
 import sys
 import termios
@@ -50,7 +49,7 @@ K_END = 271
 K_PPAGE = 339
 K_NPAGE = 338
 
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER = "🌑🌒🌓🌔🌕🌖🌗🌘"
 
 # style ids (mapped to curses attrs in _curses_setup; pure layer stays curses-free)
 STY_PLAIN = 0
@@ -58,6 +57,7 @@ STY_DIM = 1
 STY_YOU = 2
 STY_TOOL = 3
 STY_INFO = 4
+STY_STATUS = 5
 
 _ROLE_STYLE = {
     "thinking": STY_DIM,
@@ -154,9 +154,13 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
         idx = top + i
         rows.append(all_lines[idx] if idx < total else [("", STY_PLAIN)])
 
-    # DEBUG: status bar is frozen (no spinner, no updates) while display issues are tracked down.
-    tok = f" tokens: {state.tokens}/{state.context_size}" if state.context_size else ""
-    rows.append([(f"status: {state.status}{tok}", STY_DIM)])
+    label = f"{SPINNER[state.frame % len(SPINNER)]} thinking" if state.busy else state.status
+    if state.context_size:
+        pct = int(state.tokens * 100 / state.context_size)
+        tok = f" tokens: {state.tokens}/{state.context_size} ({pct}%)"
+    else:
+        tok = ""
+    rows.append([(f"status: {label}{tok}", STY_STATUS)])
 
     prompt: list[tuple[str, int]] = [("> ", STY_YOU), (state.input_buf, STY_PLAIN)]
     if not state.input_buf:
@@ -187,6 +191,15 @@ def apply_token(state: UIState, role: str, text: str, chunk: bool) -> None:
     else:
         # per-LLM-call end marker
         _finalize_active(state)
+
+
+def submit_message(state: UIState, text: str) -> None:
+    """Record the user's prompt in the scrollback (matching how history
+    renders it) and start the turn."""
+    _finalize_active(state)
+    state.blocks.append(Block("user", "You: ", text, STY_YOU))
+    state.scroll_up = 0  # follow the new content
+    state.busy = True
 
 
 def apply_key(state: UIState, key, view_h: int = 24) -> tuple[str, str]:
@@ -301,8 +314,9 @@ def apply_event(state: UIState, event) -> None:
         case TurnDone(_):
             _finalize_active(state)
             state.busy = False
-        case UsageReport(_, _):
-            pass  # DEBUG: token updates to the status bar are frozen while debugging
+            state.status = "ready"
+        case UsageReport(_, data):
+            state.tokens = int(data.get("prompt_tokens", 0)) + int(data.get("completion_tokens", 0))
         case History(messages):
             for block in blocks_from_history(messages):
                 state.blocks.append(block)
@@ -341,24 +355,30 @@ def _curses_setup() -> "curses._CursesWindow":
         curses.init_pair(1, curses.COLOR_CYAN, -1)
         curses.init_pair(2, curses.COLOR_MAGENTA, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_GREEN, -1)
         _STYLE_ATTRS.update(
             {
                 STY_PLAIN: 0,
+                # faded text (thinking, hints)
                 STY_DIM: curses.A_DIM,
                 STY_YOU: curses.A_BOLD | curses.color_pair(1),
                 STY_TOOL: curses.color_pair(2),
                 STY_INFO: curses.A_BOLD | curses.color_pair(3),
+                # bold green: UI chrome, distinct from the cyan "You:" text.
+                STY_STATUS: curses.A_BOLD | curses.color_pair(4),
             }
         )
     except curses.error:
-        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: 0, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD})
-    curses.cbreak()
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD})
+    # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
+    # our decoder instead of raising SIGINT. Input is read from stdin directly;
+    # getch is never used.
+    curses.raw()
     curses.noecho()
-    stdscr.nodelay(True)
     # NOTE: mouse reporting is deliberately NOT enabled. This system's ncurses
-    # enables SGR mouse mode but fails to parse the sequences, so every click/
-    # wheel event leaks into getch() as raw garbage characters. Scroll with
-    # up/down, PgUp/PgDn, Home/End instead.
+    # enables SGR mouse mode but fails to parse the sequences; _decode_input
+    # swallows any mouse sequences that do arrive. Scroll with up/down,
+    # PgUp/PgDn, Home/End instead.
     try:
         curses.curs_set(1)
     except curses.error:
@@ -461,8 +481,11 @@ def _render(stdscr, state: UIState) -> None:
 
 
 async def run(bus: Bus, context_size: int = 0) -> None:
-    """Run the curses UI until cancelled or quit."""
-    global _stop_evt
+    """Run the curses UI until cancelled or quit.
+
+    All curses I/O happens on the event-loop thread; key input is read raw
+    from stdin via select() (no worker thread), so stdscr is never touched
+    concurrently and ncurses' screen bookkeeping stays consistent."""
     _diagnose_terminal()
     stdscr = _curses_setup()
     try:
@@ -470,42 +493,77 @@ async def run(bus: Bus, context_size: int = 0) -> None:
     except Exception:
         pass
     state = UIState(context_size=context_size)
-    key_q: asyncio.Queue = asyncio.Queue()
+    fd = sys.stdin.fileno()
+    os.set_blocking(fd, False)
     loop = asyncio.get_running_loop()
-    _stop_evt = threading.Event()
-    reader = threading.Thread(target=_key_reader, args=(stdscr, key_q, loop, _stop_evt), daemon=True)
-    reader.start()
+    inbox: dict = {"data": b"", "eof": False}
+
+    def _on_readable() -> None:
+        try:
+            data = os.read(fd, 4096)
+        except (BlockingIOError, OSError):
+            return
+        if data == b"":
+            inbox["eof"] = True
+            return
+        inbox["data"] += data
+
+    loop.add_reader(fd, _on_readable)
+    pending = b""
+    pend_start = 0.0
+    last_spin = 0.0
     try:
         while True:
+            await asyncio.sleep(0.033)  # tick + await point for cancellation
+            if inbox["eof"]:
+                break  # stdin closed
+            keys, pending = _decode_input(pending + inbox["data"])
+            inbox["data"] = b""
+            if pending:
+                now = time.monotonic()
+                if pend_start == 0.0:
+                    pend_start = now
+                elif now - pend_start > 0.03 or len(pending) >= 16:
+                    # Grace period expired: a bare ESC (or a truncated
+                    # sequence that will never complete).
+                    if pending == b"\x1b":
+                        keys.append(K_ESC)
+                    pending = b""
+            else:
+                pend_start = 0.0
             try:
-                with _curses_lock:
-                    height, _width = stdscr.getmaxyx()
+                h, w = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8))[:2]
+                if (h, w) != stdscr.getmaxyx():
+                    curses.resizeterm(h, w)
             except Exception:
-                height = 24
-            key = await _next_key(key_q, 0.033)
-            if key is not None and key != K_RESIZE:
+                pass
+            for key in keys:
+                height, _width = stdscr.getmaxyx()
                 action, payload = apply_key(state, key, view_h=max(1, height - 2))
                 if action == "submit":
                     msg_id = uuid.uuid4().hex[:8]
-                    state.busy = True
+                    submit_message(state, payload)
                     bus.post(UserMessage(USER_ID, payload, msg_id))
                 elif action == "interrupt":
                     bus.post(Interrupt(USER_ID))
                 elif action == "quit":
                     bus.post(Shutdown())
                     return
-            n = 0
             while not bus.outbound.empty():
                 apply_event(state, bus.outbound.get_nowait())
-                n += 1
-            logger.info("DEBUG tick: events=%d blocks=%d active=%r", n, len(state.blocks), (state.active.raw[:20] if state.active else None))
+            if state.busy:
+                now = time.monotonic()
+                if now - last_spin >= 0.2:  # 5fps: a full moon cycle in ~1.6s
+                    state.frame += 1
+                    last_spin = now
             _render(stdscr, state)
     except asyncio.CancelledError:
         pass
     finally:
-        if _stop_evt is not None:
-            _stop_evt.set()
-        reader.join(timeout=1)
+        try:
+            loop.remove_reader(fd)
+        except Exception:
+            pass
         try:
             curses.endwin()
         except Exception:
@@ -513,5 +571,5 @@ async def run(bus: Bus, context_size: int = 0) -> None:
 
 
 def stop() -> None:
-    if _stop_evt is not None:
-        _stop_evt.set()
+    # No worker threads to stop; run()'s finally block restores the terminal.
+    pass
