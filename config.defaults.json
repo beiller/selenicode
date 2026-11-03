@@ -9,5 +9,8 @@
         "tail_turns": 10,
         "trigger_pct": 80.0,
         "target_pct": 30.0
+    },
+    "vision": {
+        "max_image_bytes": 4194304
     }
 }

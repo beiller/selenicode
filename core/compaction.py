@@ -17,6 +17,8 @@ SUMMARY_MAX_TOKENS = 4_096
 PRUNE_PROTECT_RATIO = 0.25
 PRUNE_MINIMUM_RATIO = 0.10
 PRUNED_TOOL_NOTE = "[Old tool result content cleared]"
+# Fixed per-image estimate for token accounting (vision tokens scale with resolution, not file size).
+IMAGE_TOKEN_ESTIMATE = 2_048
 
 SUMMARY_SYSTEM_PROMPT = (
     "You are an anchored context summarization assistant for coding sessions. "
@@ -85,8 +87,32 @@ def compaction_target(context_size: int) -> int:
     return int(context_size * _pct("COMPACTION_TARGET_PCT") / 100)
 
 
+def _content_tokens(content) -> int:
+    """Token estimate for str or list (multimodal parts) content."""
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "image_ref":
+                    total += IMAGE_TOKEN_ESTIMATE
+                else:
+                    total += approximate_token_count(str(part.get("text", "")))
+        return total
+    return approximate_token_count(content)
+
+
 def context_token_count(messages: list[Message]) -> int:
-    return approximate_token_count(json.dumps(messages))
+    total = approximate_token_count(json.dumps(messages))
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            # json.dumps only sees the compact path form; add the real per-image cost.
+            total += sum(
+                IMAGE_TOKEN_ESTIMATE
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "image_ref"
+            )
+    return total
 
 
 def preserve_recent_budget(context_size: int) -> int:
@@ -165,9 +191,11 @@ def prune(messages: list[Message], context_size: int) -> None:
         if m.get("role") != "tool":
             continue
         content = m.get("content") or ""
-        if not content or PRUNED_TOOL_NOTE in content:
+        if not content:
             continue
-        est = approximate_token_count(content)
+        if isinstance(content, str) and PRUNED_TOOL_NOTE in content:
+            continue
+        est = _content_tokens(content)
         total += est
         if total <= protect:
             continue
@@ -184,9 +212,25 @@ def _truncate_tool_output(text: str) -> str:
     return f"{text[:TOOL_OUTPUT_MAX_CHARS]}\n[Tool output truncated for compaction: omitted {len(text) - TOOL_OUTPUT_MAX_CHARS} chars]"
 
 
+def _content_to_text(content) -> str:
+    """Flatten multimodal parts to text for the summarizer (images become path notes)."""
+    if not isinstance(content, list):
+        return content
+    parts = []
+    for part in content:
+        if isinstance(part, dict):
+            if part.get("type") == "image_ref":
+                parts.append(f"[image: {part.get('path')}]")
+            else:
+                parts.append(str(part.get("text", "")))
+    return "\n".join(parts)
+
+
 def to_summary_input(m: Message) -> dict:
     out: dict = {"role": m["role"]}
     content = m.get("content")
+    if isinstance(content, list):
+        content = _content_to_text(content)
     if m["role"] == "tool" and content:
         content = _truncate_tool_output(content)
     if content is not None:

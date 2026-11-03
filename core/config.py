@@ -6,6 +6,7 @@ _DEFAULTS = {
     "client": "terminal",
     "server": {"url": "", "api_key": "", "model": ""},
     "compaction": {"tail_turns": 10, "trigger_pct": 80.0, "target_pct": 30.0},
+    "vision": {"max_image_bytes": 4_194_304},
 }
 
 
@@ -45,6 +46,9 @@ CURRENT_MODEL = _data["server"]["model"]
 COMPACTION_TAIL_TURNS = _data["compaction"]["tail_turns"]
 COMPACTION_TRIGGER_PCT = _data["compaction"]["trigger_pct"]
 COMPACTION_TARGET_PCT = _data["compaction"]["target_pct"]
+MAX_IMAGE_BYTES = _data["vision"]["max_image_bytes"]
+# Runtime state: whether the loaded model exposes the multimodal capability (set by main at startup).
+VISION_SUPPORTED = False
 
 
 def auth_headers() -> dict[str, str]:

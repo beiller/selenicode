@@ -193,5 +193,45 @@ class TestRealConversation(CompactionBase):
         self.assertEqual(len([m for m in messages if m.get("compaction_marker")]), 1)
 
 
+class TestMultimodalAccounting(unittest.TestCase):
+    def image_msg(self, **extra) -> dict:
+        return {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "text", "text": "Image loaded from /x.png (image/png)"},
+                {"type": "image_ref", "path": "/x.png", "mime": "image/png"},
+            ],
+            **extra,
+        }
+
+    def test_context_token_count_includes_image_estimate(self):
+        plain = [{"role": "user", "content": "hi"}]
+        with_image = plain + [self.image_msg()]
+        self.assertGreaterEqual(
+            compaction.context_token_count(with_image) - compaction.context_token_count(plain),
+            compaction.IMAGE_TOKEN_ESTIMATE,
+        )
+
+    def test_prune_clears_list_content(self):
+        messages = [
+            {"role": "user", "content": "U" * 100},
+            {"role": "assistant", "content": "A" * 100},
+            {"role": "tool", "tool_call_id": "call_0", "content": "T" * 20000},
+            self.image_msg(),
+            {"role": "user", "content": "mid"},
+            {"role": "assistant", "content": "m"},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        compaction.prune(messages, context_size=4096)
+        self.assertEqual(messages[3]["content"], compaction.PRUNED_TOOL_NOTE)
+
+    def test_to_summary_input_flattens_list_content(self):
+        out = compaction.to_summary_input(self.image_msg())
+        self.assertIn("[image: /x.png]", out["content"])
+        self.assertNotIsInstance(out["content"], list)
+
+
 if __name__ == "__main__":
     unittest.main()

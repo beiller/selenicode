@@ -1,11 +1,15 @@
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
+import zlib
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import config
 from core.tools import edit_file, read_file, write_file
 
 
@@ -159,6 +163,64 @@ class TestEditFile(FileToolsBase):
         self.assertTrue(r["success"])
         self.assertEqual(r["additions"], 1)
         self.assertEqual(r["deletions"], 1)
+
+
+def make_png() -> bytes:
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + b"\xff\x00\x00\xff" * 4 for _ in range(4))
+    ihdr = struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+class TestReadFileImage(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.vision_patcher = mock.patch.object(config, "VISION_SUPPORTED", True)
+        self.vision_patcher.start()
+
+    def write_png(self, name: str) -> str:
+        path = os.path.join(self.dir.name, name)
+        with open(path, "wb") as f:
+            f.write(make_png())
+        return path
+
+    def test_png_returns_marker(self):
+        path = self.write_png("pic.png")
+        r = ok(read_file(path))
+        self.assertEqual(r["type"], "image")
+        self.assertEqual(r["path"], path)
+        self.assertEqual(r["mime"], "image/png")
+
+    def test_jpeg_magic_without_extension(self):
+        path = os.path.join(self.dir.name, "data.bin")
+        with open(path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0" + b"\x00" * 16)
+        r = ok(read_file(path))
+        self.assertEqual(r["type"], "image")
+        self.assertEqual(r["mime"], "image/jpeg")
+
+    def test_text_file_unchanged(self):
+        path = os.path.join(self.dir.name, "sample.txt")
+        with open(path, "w") as f:
+            f.write("hello\n")
+        r = ok(read_file(path))
+        self.assertEqual(r["status"], "success")
+
+    def test_over_cap_rejected(self):
+        path = self.write_png("big.png")
+        with mock.patch.object(config, "MAX_IMAGE_BYTES", 10):
+            r = ok(read_file(path))
+        self.assertIn("too large for vision", r["error"])
+
+    def test_vision_off_rejected(self):
+        path = self.write_png("pic.png")
+        with mock.patch.object(config, "VISION_SUPPORTED", False):
+            r = ok(read_file(path))
+        self.assertIn("does not support vision", r["error"])
 
 
 if __name__ == "__main__":

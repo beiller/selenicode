@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import inspect
 import json
@@ -118,6 +119,25 @@ def _parse_context_size(models: list[dict]) -> int | None:
     return None
 
 
+def _parse_vision_supported(models: list[dict]) -> bool:
+    """True when the model serves vision (llama-server /v1/models).
+
+    Prefers an exact id match for CURRENT_MODEL, falls back to any loaded model
+    (the server may report a different id than the configured name). Handles both
+    capability shapes seen in the wild: a list containing "multimodal" and a dict
+    with an "image" flag."""
+    for preferred in (True, False):
+        for model in models:
+            if preferred and model.get("id") != CURRENT_MODEL:
+                continue
+            caps = model.get("capabilities") or []
+            if isinstance(caps, dict):
+                return bool(caps.get("image"))
+            if "multimodal" in caps:
+                return True
+    return False
+
+
 async def wait_for_context_size() -> None:
     """Keep trying to get the context size from the server until it succeeds; never gives up.
 
@@ -138,6 +158,7 @@ async def wait_for_context_size() -> None:
             if n_ctx is None:
                 raise RuntimeError(f"No context size in model list for {CURRENT_MODEL}")
             CONTEXT_SIZE = n_ctx
+            config.VISION_SUPPORTED = _parse_vision_supported(models)
         except Exception as e:
             logger.warning(f"Context size check failed (attempt {attempt}): {e!r}; retrying in {delay_a:.0f}s")
             report_error("", f"Model server connection failed (attempt {attempt}): {e} - retrying in {delay_a:.0f}s")
@@ -153,6 +174,15 @@ async def wait_for_context_size() -> None:
         ctx_ready.set()
 
 
+def _is_unsupported_endpoint(e: BaseException) -> bool:
+    """True when a 404/405 means the server lacks the model-management endpoints (not router mode)."""
+    for attr in ("status", "code"):
+        value = getattr(e, attr, None)
+        if isinstance(value, int):
+            return value in (404, 405)
+    return False
+
+
 async def startup_load_model() -> None:
     """Load the model in the background; management endpoints may not exist (e.g. vLLM)."""
     if not CURRENT_MODEL:
@@ -162,7 +192,18 @@ async def startup_load_model() -> None:
     try:
         await _run_daemon(load_model_and_set, CURRENT_MODEL)
     except Exception as e:
-        logger.error(f"Model load at startup failed: {e!r}; continuing")
+        if not _is_unsupported_endpoint(e):
+            logger.error(f"Model load at startup failed: {e!r}; continuing")
+            return
+        # The server is not in router mode; it serves whatever model it was started with.
+        try:
+            loaded = await _run_daemon(get_loaded_model)
+        except Exception:
+            loaded = None
+        if loaded:
+            logger.warning(f"Server does not support dynamic model loading; continuing with preloaded model {loaded!r}")
+        else:
+            logger.error(f"Model load at startup failed: {e!r}; no model is loaded and the server cannot load one")
 
 
 async def handle_server_command(user_id: UserID, msg_id: str, text: str) -> None:
@@ -275,8 +316,87 @@ def make_system_message(content: str) -> Message:
     return {"role": "system", "content": content}
 
 
-def make_tool_result_message(tool_call_id: str, content: str) -> Message:
+def make_tool_result_message(tool_call_id: str, content: str | list) -> Message:
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+def _tool_output_to_content(output: str) -> str | list:
+    """Turn a read_file image marker into multimodal message parts; any other output passes through."""
+    try:
+        parsed = json.loads(output)
+    except (ValueError, TypeError):
+        return output
+    if isinstance(parsed, dict) and parsed.get("type") == "image" and "path" in parsed and "mime" in parsed:
+        return [
+            {"type": "text", "text": f"Image loaded from {parsed['path']} ({parsed['mime']})"},
+            {"type": "image_ref", "path": parsed["path"], "mime": parsed["mime"]},
+        ]
+    return output
+
+
+def _encode_image_ref(part: dict) -> dict:
+    """Resolve a stored image_ref part into an OpenAI data-URL part (or a text fallback)."""
+    path = part.get("path", "")
+    mime = part.get("mime", "image/png")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return {"type": "text", "text": f"[image unavailable: {path}]"}
+    b64 = base64.b64encode(data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+
+MEDIA_MARKER = "<__media__>"
+MEDIA_MARKER_REPLACEMENT = "[media]"
+
+
+def _scrub_media_marker(text: str) -> str:
+    """Replace the marker the server reserves for media parts so text never carries it."""
+    return text.replace(MEDIA_MARKER, MEDIA_MARKER_REPLACEMENT) if MEDIA_MARKER in text else text
+
+
+def _attach_images(content: list) -> list:
+    """Encode image_ref parts for the API on a copy; history keeps the compact path form.
+
+    Also scrubs the reserved media marker from text parts (the server 400s a request
+    that carries media when any message text contains the marker)."""
+    out = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_ref":
+            out.append(_encode_image_ref(part))
+        elif isinstance(part, dict):
+            p = dict(part)
+            if isinstance(p.get("text"), str):
+                p["text"] = _scrub_media_marker(p["text"])
+            out.append(p)
+        else:
+            out.append(part)
+    return out
+
+
+def _scrub_obj(obj):
+    """Recursively replace the reserved marker in every string (on a copy; marker-free values pass through).
+
+    Applied to the whole prepared message so no field can carry the marker (content,
+    reasoning_content, tool_calls arguments, ...); the base64 in encoded image parts
+    cannot contain it, so data URLs are untouched."""
+    if isinstance(obj, str):
+        return _scrub_media_marker(obj)
+    if isinstance(obj, dict):
+        return {k: _scrub_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_obj(v) for v in obj]
+    return obj
+
+
+def _prepare_message(m: Message) -> Message:
+    """Strip timestamps; encode image_ref parts and scrub the reserved media marker (on a copy)."""
+    out = {k: v for k, v in m.items() if k != "timestamp"}
+    content = out.get("content")
+    if isinstance(content, list):
+        out["content"] = _attach_images(content)
+    return _scrub_obj(out)
 
 
 # ---------------------------------------------------------------------------
@@ -302,12 +422,9 @@ async def stream_chat_completion(
 
     # Add dynamic context to system prompt (keep stable across calls so the server's prompt cache can be reused)
     session_context = f"\n\nActive session: {session_id}"
-    system_content += session_context
+    system_content = _scrub_media_marker(system_content + session_context)
 
-    # Strip timestamps before sending to LLM API
-    msgs = [make_system_message(system_content)] + [
-        {k: v for k, v in m.items() if k != "timestamp"} for m in messages if m.get("role") != "system"
-    ]
+    msgs = [make_system_message(system_content)] + [_prepare_message(m) for m in messages if m.get("role") != "system"]
     body: ChatCompletionRequest = {
         "model": CURRENT_MODEL,
         "messages": msgs,
@@ -488,7 +605,7 @@ async def execute_tool_calls(
             except Exception as e:
                 report_error(user_id, f"Tool {name} failed", e)
                 output = json.dumps({"error": f"Tool {name} raised an exception: {e}"})
-        results.append(make_tool_result_message(tc["id"], output))
+        results.append(make_tool_result_message(tc["id"], _tool_output_to_content(output)))
     return results
 
 

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -755,6 +756,171 @@ class TestHelpCommand(unittest.TestCase):
         help_texts = [e.text for e in events if isinstance(e, bus_mod.Token)]
         self.assertTrue(any("/compact" in t and "/server" in t and "/help" in t for t in help_texts))
         self.assertTrue(any(isinstance(e, bus_mod.TurnDone) for e in events))
+
+
+class TestVisionHelpers(unittest.TestCase):
+    def test_tool_output_to_content_marker_becomes_parts(self):
+        out = main._tool_output_to_content(json.dumps({"type": "image", "path": "/a/b.png", "mime": "image/png"}))
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[0]["type"], "text")
+        self.assertIn("/a/b.png", out[0]["text"])
+        self.assertEqual(out[1]["type"], "image_ref")
+        self.assertEqual(out[1]["path"], "/a/b.png")
+        self.assertEqual(out[1]["mime"], "image/png")
+
+    def test_tool_output_to_content_plain_passes_through(self):
+        self.assertEqual(main._tool_output_to_content("hello"), "hello")
+        self.assertEqual(main._tool_output_to_content(json.dumps({"error": "nope"})), json.dumps({"error": "nope"}))
+
+    def test_attach_images_encodes_and_keeps_history_form(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.png")
+            with open(path, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+            content = [
+                {"type": "text", "text": "Image loaded from x.png (image/png)"},
+                {"type": "image_ref", "path": path, "mime": "image/png"},
+            ]
+            encoded = main._attach_images(content)
+        self.assertEqual(encoded[1]["type"], "image_url")
+        self.assertTrue(encoded[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        # history (the input list) is untouched
+        self.assertEqual(content[1]["type"], "image_ref")
+        # text part is copied, not shared
+        self.assertIsNot(encoded[0], content[0])
+
+    def test_attach_images_missing_file_falls_back_to_text(self):
+        encoded = main._attach_images([{"type": "image_ref", "path": "/no/such/file.png", "mime": "image/png"}])
+        self.assertEqual(encoded[0]["type"], "text")
+        self.assertIn("image unavailable", encoded[0]["text"])
+
+    def test_scrub_media_marker(self):
+        self.assertEqual(main._scrub_media_marker('a message contains "<__media__>"'), 'a message contains "[media]"')
+        # no marker -> same object, not a copy
+        plain = "plain text"
+        self.assertIs(main._scrub_media_marker(plain), plain)
+
+    def test_attach_images_scrubs_reserved_marker_from_text_parts(self):
+        content = [
+            {"type": "text", "text": 'return "<__media__>";'},
+            {"type": "image_ref", "path": "/no/such/file.png", "mime": "image/png"},
+        ]
+        encoded = main._attach_images(content)
+        self.assertNotIn(main.MEDIA_MARKER, encoded[0]["text"])
+        self.assertIn("[media]", encoded[0]["text"])
+        # history keeps the literal marker (only the send copy is scrubbed)
+        self.assertEqual(content[0]["text"], 'return "<__media__>";')
+
+    def test_prepare_message_scrubs_string_content_and_reasoning(self):
+        msg = {
+            "role": "user",
+            "content": 'error: a message contains "<__media__>"',
+            "reasoning_content": "the marker is <__media__>",
+            "timestamp": "2026-11-03T14:35:00",
+        }
+        out = main._prepare_message(msg)
+        self.assertNotIn(main.MEDIA_MARKER, out["content"])
+        self.assertIn("[media]", out["content"])
+        self.assertNotIn(main.MEDIA_MARKER, out["reasoning_content"])
+        self.assertNotIn("timestamp", out)
+        # original message untouched
+        self.assertIn(main.MEDIA_MARKER, msg["content"])
+        self.assertIn(main.MEDIA_MARKER, msg["reasoning_content"])
+
+    def test_prepare_message_plain_strings_pass_through(self):
+        msg = {"role": "user", "content": "hello"}
+        out = main._prepare_message(msg)
+        self.assertIs(out["content"], "hello")
+
+    def test_prepare_message_scrubs_marker_in_tool_call_arguments(self):
+        # regression: a resumed session whose tool-call arguments quote the marker
+        # (e.g. the edit that adds the scrub itself) 400'd once the request carried media
+        msg = {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": None,
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {"name": "edit_file", "arguments": json.dumps({"new_string": 'MEDIA_MARKER = "<__media__>"'})},
+                }
+            ],
+            "timestamp": "2026-11-03T14:35:00",
+        }
+        out = main._prepare_message(msg)
+        self.assertNotIn(main.MEDIA_MARKER, json.dumps(out))
+        self.assertIn("[media]", out["tool_calls"][0]["function"]["arguments"])
+        # original message untouched
+        self.assertIn(main.MEDIA_MARKER, msg["tool_calls"][0]["function"]["arguments"])
+
+    def test_parse_vision_supported(self):
+        with mock.patch.object(main, "CURRENT_MODEL", "m1"):
+            self.assertTrue(main._parse_vision_supported([{"id": "m1", "capabilities": ["completion", "multimodal"]}]))
+            self.assertFalse(main._parse_vision_supported([{"id": "m1", "capabilities": ["completion"]}]))
+            # no model with vision at all -> False (the id-mismatch case falls back to any model)
+            self.assertFalse(main._parse_vision_supported([{"id": "other", "capabilities": ["completion"]}]))
+            self.assertTrue(main._parse_vision_supported([{"id": "m1", "capabilities": {"chat": True, "image": True}}]))
+            self.assertFalse(main._parse_vision_supported([{"id": "m1", "capabilities": {"chat": True, "image": False}}]))
+            # server may report a different id than the configured name: fall back to any model
+            self.assertTrue(main._parse_vision_supported([{"id": "other", "capabilities": {"image": True}}]))
+
+
+class TestStartupLoadModel(unittest.TestCase):
+    def _run_startup(self, load_exc, loaded_model, get_loaded_exc=None):
+        calls = []
+
+        async def fake_run_daemon(fn, *args):
+            calls.append(fn.__name__)
+            if fn is main.load_model_and_set:
+                if load_exc is not None:
+                    raise load_exc
+                return None
+            if fn is main.get_loaded_model:
+                if get_loaded_exc is not None:
+                    raise get_loaded_exc
+                return loaded_model
+            raise AssertionError(f"unexpected function {fn}")
+
+        with mock.patch.object(main, "CURRENT_MODEL", "m1"), mock.patch.object(main, "_run_daemon", fake_run_daemon):
+            asyncio.run(main.startup_load_model())
+        return calls
+
+    def test_unsupported_endpoint_with_preloaded_model_warns(self):
+        import urllib.error
+
+        exc = urllib.error.HTTPError("http://x/models/load", 404, "Not Found", {}, None)
+        with self.assertLogs("root", level="WARNING") as logs:
+            calls = self._run_startup(exc, "qwen35")
+        self.assertIn("get_loaded_model", calls)
+        self.assertTrue(any("does not support dynamic model loading" in m and "'qwen35'" in m for m in logs.output))
+
+    def test_unsupported_endpoint_without_preloaded_model_errors(self):
+        import urllib.error
+
+        exc = urllib.error.HTTPError("http://x/models/load", 404, "Not Found", {}, None)
+        with self.assertLogs("root", level="ERROR") as logs:
+            calls = self._run_startup(exc, None)
+        self.assertIn("get_loaded_model", calls)
+        self.assertTrue(any("cannot load one" in m for m in logs.output))
+
+    def test_unsupported_endpoint_lookup_failure_errors(self):
+        import urllib.error
+
+        exc = urllib.error.HTTPError("http://x/models/load", 405, "Method Not Allowed", {}, None)
+        with self.assertLogs("root", level="ERROR") as logs:
+            self._run_startup(exc, None, get_loaded_exc=RuntimeError("server down"))
+        self.assertTrue(any("cannot load one" in m for m in logs.output))
+
+    def test_other_failure_errors_without_lookup(self):
+        with self.assertLogs("root", level="ERROR") as logs:
+            calls = self._run_startup(ConnectionError("refused"), "qwen35")
+        self.assertNotIn("get_loaded_model", calls)
+        self.assertTrue(any("Model load at startup failed" in m for m in logs.output))
+
+    def test_success_no_lookup(self):
+        calls = self._run_startup(None, None)
+        self.assertEqual(calls, ["load_model_and_set"])
 
 
 if __name__ == "__main__":

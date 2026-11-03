@@ -185,6 +185,32 @@ def _suggest_files(filepath: str) -> list[str]:
     return [os.path.join(directory, e) for e in sorted(matches)[:3]]
 
 
+_IMAGE_EXTS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp", ".gif": "image/gif"}
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF8", "image/gif"),
+)
+
+
+def _sniff_image(filepath: str) -> str | None:
+    """Return the mime type when the file is an image the model server can decode, else None."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in _IMAGE_EXTS:
+        return _IMAGE_EXTS[ext]
+    try:
+        with open(filepath, "rb") as fh:
+            head = fh.read(26)
+    except OSError:
+        return None
+    for magic, mime in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    if head[:2] == b"BM" and len(head) >= 14 and head[6:10] == b"\x00\x00\x00\x00":
+        return "image/bmp"
+    return None
+
+
 def read_file(file_path: str, offset: int | None = None, limit: int | None = None) -> str:
     """Read a file or directory from the local filesystem. If the path does not exist, an error is returned.
 
@@ -195,6 +221,7 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
     - To read later sections, call this tool again with a larger offset.
     - Contents are returned with each line prefixed by its line number as `<line>: <content>`. For directories, entries are returned one per line with a trailing `/` for subdirectories.
     - Any line longer than 2000 characters is truncated. Output is capped at 50 KB.
+    - Image files (png/jpg/jpeg/bmp/gif) are returned as visual content you can see; gif only exposes its first frame.
     - Call this tool in parallel when you know there are multiple files you want to read.
     - Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.
     """
@@ -206,6 +233,15 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
         if suggestions:
             msg += "\n\nDid you mean one of these?\n" + "\n".join(suggestions)
         return json.dumps({"error": msg})
+
+    mime = _sniff_image(filepath)
+    if mime is not None and os.path.isfile(filepath):
+        if not config.VISION_SUPPORTED:
+            return json.dumps({"error": f"{filepath} is an image ({mime}) but the model server does not support vision"})
+        size = os.path.getsize(filepath)
+        if size > config.MAX_IMAGE_BYTES:
+            return json.dumps({"error": f"{filepath} is too large for vision ({size} bytes, limit {config.MAX_IMAGE_BYTES})"})
+        return json.dumps({"type": "image", "path": filepath, "mime": mime})
 
     if offset is not None:
         try:

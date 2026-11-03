@@ -20,7 +20,15 @@ def archive_conversation(session_id: str, messages: List[Message]) -> str:
             archive_text += "[" + message["timestamp"] + "] "
         archive_text += message["role"] + ":\n"
         if "content" in message and message["content"]:
-            archive_text += message["content"] + "\n"
+            content = message["content"]
+            if isinstance(content, list):
+                content = "\n".join(
+                    f"[image: {p.get('path')}]"
+                    if isinstance(p, dict) and p.get("type") == "image_ref"
+                    else str(p.get("text", ""))
+                    for p in content
+                )
+            archive_text += content + "\n"
         if "reasoning_content" in message and message["reasoning_content"]:
             archive_text += "(thinking) " + message["reasoning_content"] + "\n"
         if "tool_calls" in message and message["tool_calls"]:
