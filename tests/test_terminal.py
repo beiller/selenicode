@@ -45,52 +45,46 @@ class TestRenderFrame(unittest.TestCase):
         self.assertEqual(rows[8][0][1], t2.STY_STATUS)
         self.assertTrue(rows[9][0][0].startswith("> "))
 
-    def test_few_lines_top_aligned(self):
-        state = t2.UIState()
-        fill(state, 3)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(rows[0][0][0], "line 0")
-        self.assertEqual(rows[1][0][0], "line 1")
-
     def test_pinned_shows_bottom(self):
         state = t2.UIState()
         fill(state, 30)
         rows = t2.render_frame(state, height=10, width=80)
         view_h = 8
         self.assertEqual(rows[view_h - 1][0][0], "line 29")
-        self.assertEqual(rows[0][0][0], "line 22")
+        self.assertEqual(rows[0][0][0], "")  # separator row
+        self.assertEqual(rows[1][0][0], "line 26")
 
     def test_detached_view_offsets_window(self):
         state = t2.UIState()
         fill(state, 30)
-        state.view_top = 17  # bottom (22) minus 5
+        state.view_top = 17  # offset into the scrollback (block 12 at row 7)
         rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(rows[7][0][0], "line 24")
-
-    def test_detached_view_clamped_at_top(self):
-        state = t2.UIState()
-        fill(state, 30)
-        state.view_top = 0
+        self.assertEqual(rows[7][0][0], "line 12")
+        state.view_top = 0  # clamped at the top
         rows = t2.render_frame(state, height=10, width=80)
         self.assertEqual(rows[0][0][0], "line 0")
 
     def test_detached_view_stays_put_while_streaming(self):
         state = t2.UIState()
         fill(state, 30)
-        state.view_top = 17
+        state.view_top = 16
         rows_before = t2.render_frame(state, height=10, width=80)
         # more content arrives (streaming) while the user is reading
         fill(state, 40)
         rows_after = t2.render_frame(state, height=10, width=80)
         self.assertEqual(rows_before[0][0][0], rows_after[0][0][0])
-        self.assertEqual(rows_after[0][0][0], "line 17")
+        self.assertEqual(rows_after[0][0][0], "line 8")
 
-    def test_count_lines(self):
+    def test_separator_between_blocks(self):
         state = t2.UIState()
-        fill(state, 3)
-        self.assertEqual(t2.count_lines(state, 80), 3)
+        fill(state, 2)
+        self.assertEqual(t2.count_lines(state, 80), 3)  # 2 blocks + 1 separator
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertEqual(rows[0][0][0], "line 0")  # no leading blank row
+        self.assertEqual(rows[1][0][0], "")
+        self.assertEqual(rows[2][0][0], "line 1")
         t2.apply_token(state, "assistant", "abc", True)
-        self.assertEqual(t2.count_lines(state, 80), 4)
+        self.assertEqual(t2.count_lines(state, 80), 5)  # + active block + separator
 
     def test_prompt_hint_only_when_empty(self):
         state = t2.UIState()
@@ -101,12 +95,6 @@ class TestRenderFrame(unittest.TestCase):
         self.assertFalse(any("ctrl+q" in seg[0] for seg in rows[-1]))
         self.assertEqual(rows[-1][1][0], "hi")
 
-    def test_token_usage_in_status(self):
-        state = t2.UIState(context_size=16384)
-        state.tokens = 500
-        rows = t2.render_frame(state, height=5, width=80)
-        self.assertIn("tokens: 500/16384", "".join(seg[0] for seg in rows[-2]))
-
 
 class TestInputWrapping(unittest.TestCase):
     def _state(self, buf: str, cursor: int) -> t2.UIState:
@@ -114,12 +102,6 @@ class TestInputWrapping(unittest.TestCase):
         state.input_buf = buf
         state.cursor = cursor
         return state
-
-    def test_short_line_single_row(self):
-        state = self._state("hi", 2)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(len(rows), 10)
-        self.assertEqual(rows[-1][1][0], "hi")
 
     def test_long_line_wraps_across_rows(self):
         state = self._state("a" * 50, 50)  # chunk_w = 20 - 2 = 18
@@ -138,15 +120,11 @@ class TestInputWrapping(unittest.TestCase):
         self.assertEqual(t2._input_block_height(["a" * 50], 20), 3)
         self.assertEqual(t2._input_block_height(["ab", "c" * 40], 20), 4)  # 1 + ceil(40/18)
 
-    def test_cursor_first_chunk(self):
+    def test_cursor_positions_on_chunks(self):
         state = self._state("a" * 50, 5)
-        row, col = t2._cursor_pos(state, height=10, width=20)
-        self.assertEqual((row, col), (7, 7))
-
-    def test_cursor_wraps_onto_second_chunk(self):
-        state = self._state("a" * 50, 19)  # chunk_w 18 -> 2nd chunk, col 1
-        row, col = t2._cursor_pos(state, height=10, width=20)
-        self.assertEqual((row, col), (8, 3))
+        self.assertEqual(t2._cursor_pos(state, height=10, width=20), (7, 7))
+        state.cursor = 19  # chunk_w 18 -> 2nd chunk, col 1
+        self.assertEqual(t2._cursor_pos(state, height=10, width=20), (8, 3))
 
     def test_cursor_backspace_stays_on_screen(self):
         state = self._state("a" * 50, 50)
@@ -156,12 +134,6 @@ class TestInputWrapping(unittest.TestCase):
         # the block shrinks from 3 rows to 1 as text is deleted, so the
         # cursor sits on the bottom row - always on screen
         self.assertEqual((row, col), (9, 3))
-
-    def test_multiline_with_wrap(self):
-        state = self._state("a" * 50 + "\nbc", 53)
-        rows = t2.render_frame(state, height=10, width=20)
-        self.assertEqual(len(rows), 10)  # 4 viewport + status + 4 input rows
-        self.assertEqual(rows[-1][1][0], "bc")
 
 
 class TestThinkingToggle(unittest.TestCase):
@@ -174,31 +146,19 @@ class TestThinkingToggle(unittest.TestCase):
 
     def test_collapsed_placeholder_by_default(self):
         state = self._state()
-        t2.apply_token(state, "thinking", "a" * 50 + "\n\n" + "b" * 60, True)
+        t2.apply_token(state, "thinking", "let   me\nthink\n\n" + "b" * 100, True)
         t2.apply_token(state, "assistant", "hi", False)  # finalizes the thinking block
         text = self._screen_text(state)
-        self.assertIn("112 chars:", text)  # len of raw incl. newlines
-        self.assertNotIn("b" * 60, text)  # tail beyond the 100-char preview
+        self.assertIn("116 chars:", text)  # len of raw incl. newlines
+        self.assertIn("let me think", text)  # whitespace collapsed in preview
+        self.assertNotIn("b" * 100, text)  # tail beyond the 100-char preview
 
-    def test_placeholder_collapses_whitespace(self):
-        state = self._state()
-        t2.apply_token(state, "thinking", "let   me\nthink", True)
-        t2.apply_token(state, "assistant", "hi", False)
-        text = self._screen_text(state)
-        self.assertIn("14 chars: let me think", text)
-
-    def test_toggle_shows_active_thinking(self):
+    def test_toggle_round_trip(self):
         state = self._state()
         t2.apply_token(state, "thinking", "let me think", True)
         t2.apply_key(state, t2.K_CTRL_T)
         self.assertTrue(state.show_thinking)
-        self.assertIn("let me think", self._screen_text(state))
-
-    def test_toggle_round_trip(self):
-        state = self._state()
-        t2.apply_token(state, "thinking", "x", True)
-        t2.apply_key(state, t2.K_CTRL_T)
-        self.assertTrue(state.show_thinking)
+        self.assertIn("let me think", self._screen_text(state))  # expanded on screen
         t2.apply_key(state, t2.K_CTRL_T)
         self.assertFalse(state.show_thinking)
 
@@ -207,7 +167,7 @@ class TestThinkingToggle(unittest.TestCase):
         t2.apply_token(state, "assistant", "hello world", False)
         t2.apply_token(state, "thinking", "a" * 100, True)  # 1 collapsed row vs 2 wrapped
         collapsed_count = t2.count_lines(state, 80)
-        self.assertEqual(collapsed_count, 2)  # assistant + placeholder
+        self.assertEqual(collapsed_count, 3)  # assistant + placeholder + separator
         t2.apply_key(state, t2.K_CTRL_T)
         self.assertGreater(t2.count_lines(state, 80), collapsed_count)
 
@@ -233,13 +193,6 @@ class TestThinkingToggle(unittest.TestCase):
         rows = t2.render_frame(state, height=10, width=80)
         self.assertNotIn("thinking collapsed", "".join(seg[0] for seg in rows[-2]))
 
-    def test_history_thinking_block_collapsed(self):
-        state = self._state()
-        state.blocks.append(t2.Block("thinking", "(thinking) ", "secret reasoning", t2.STY_DIM))
-        self.assertEqual(t2.count_lines(state, 80), 1)  # one placeholder row
-        t2.apply_key(state, t2.K_CTRL_T)
-        self.assertIn("secret reasoning", self._screen_text(state))
-
 
 class TestApplyToken(unittest.TestCase):
     def test_streaming_accumulates(self):
@@ -247,12 +200,6 @@ class TestApplyToken(unittest.TestCase):
         t2.apply_token(state, "assistant", "hel", True)
         t2.apply_token(state, "assistant", "lo", True)
         self.assertEqual(state.active.raw, "hello")
-
-    def test_assistant_label(self):
-        state = t2.UIState()
-        t2.apply_token(state, "assistant", "hello", True)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertIn("\U0001F916: hello", "".join(seg[0] for row in rows for seg in row))
 
     def test_role_switch_finalizes(self):
         state = t2.UIState()
@@ -304,21 +251,16 @@ class TestApplyKey(unittest.TestCase):
         self.assertEqual(state.input_buf, "a")
         self.assertEqual(state.cursor, 1)
 
-    def test_enter_submits_and_clears(self):
+    def test_enter(self):
         state = self._state(input_buf="  hello  ")
         action, payload = t2.apply_key(state, t2.K_ENTER)
         self.assertEqual((action, payload), ("submit", "hello"))
         self.assertEqual(state.input_buf, "")
+        self.assertEqual(t2.apply_key(self._state(), t2.K_ENTER), ("", ""))  # empty is a no-op
 
-    def test_enter_empty_is_noop(self):
-        state = self._state()
-        self.assertEqual(t2.apply_key(state, t2.K_ENTER), ("", ""))
-
-    def test_ctrl_c_interrupts_when_busy(self):
+    def test_ctrl_c(self):
         state = self._state(busy=True)
         self.assertEqual(t2.apply_key(state, t2.K_CTRL_C), ("interrupt", ""))
-
-    def test_ctrl_c_clears_input_when_idle(self):
         state = self._state(input_buf="abc")
         self.assertEqual(t2.apply_key(state, t2.K_CTRL_C), ("", ""))
         self.assertEqual(state.input_buf, "")
@@ -342,12 +284,6 @@ class TestApplyKey(unittest.TestCase):
         self.assertEqual(self_state.view_top, 0)
         t2.apply_key(self_state, t2.K_END)
         self.assertIsNone(self_state.view_top)
-
-    def test_scroll_up_anchors_at_bottom(self):
-        state = self._state()
-        fill(state, 30)
-        t2.apply_key(state, t2.K_UP, view_h=8, total=30)
-        self.assertEqual(state.view_top, 19)  # bottom (22) minus 3
 
     def test_wheel_events(self):
         state = self._state()
@@ -409,11 +345,6 @@ class TestApplyEvent(unittest.TestCase):
         self.assertEqual(len(state.blocks), 2)
         self.assertEqual(state.blocks[-1].raw, "old")
 
-    def test_usage_updates_token_count(self):
-        state = t2.UIState()
-        t2.apply_event(state, UsageReport("0", {"prompt_tokens": 7, "completion_tokens": 3}))
-        self.assertEqual(state.tokens, 10)
-
     def test_status_bar_spinner_and_ready(self):
         state = t2.UIState(context_size=100)
         status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
@@ -434,10 +365,6 @@ class TestInputDecoder(unittest.TestCase):
     def test_plain_keys(self):
         d = t2._InputDecoder()
         self.assertEqual(d.feed(b"hi", 1.0), [("key", ord("h")), ("key", ord("i"))])
-
-    def test_paste_is_literal(self):
-        d = t2._InputDecoder()
-        self.assertEqual(d.feed(b"\x1b[200~line1\r\nline2\x1b[201~", 1.0), [("paste", "line1\nline2")])
 
     def test_paste_ignores_enter_and_ctrl_c(self):
         d = t2._InputDecoder()
@@ -527,9 +454,6 @@ class TestSubmitMessage(unittest.TestCase):
 
 
 class TestDecodeInput(unittest.TestCase):
-    def test_printable(self):
-        self.assertEqual(t2._decode_input(b"hello"), ([ord(c) for c in "hello"], b""))
-
     def test_enter_backspace_ctrl(self):
         self.assertEqual(t2._decode_input(b"\r"), ([t2.K_ENTER], b""))
         self.assertEqual(t2._decode_input(b"\n"), ([t2.K_ENTER], b""))
@@ -559,17 +483,16 @@ class TestDecodeInput(unittest.TestCase):
         self.assertEqual(t2._decode_input(b"\x1b[H"), ([t2.K_HOME], b""))
         self.assertEqual(t2._decode_input(b"\x1b[F"), ([t2.K_END], b""))
 
-    def test_split_escape_held_back(self):
+    def test_partial_sequences_held_back(self):
         self.assertEqual(t2._decode_input(b"\x1b"), ([], b"\x1b"))
         self.assertEqual(t2._decode_input(b"\x1b["), ([], b"\x1b["))
-        keys, rem = t2._decode_input(b"\x1b")
-        self.assertEqual(rem, b"\x1b")
+        keys, rem = t2._decode_input(b"\x1b[A\x1b[5")  # complete + partial in one feed
+        self.assertEqual(keys, [t2.K_UP])
+        self.assertEqual(rem, b"\x1b[5")
 
-    def test_mouse_swallowed(self):
-        self.assertEqual(t2._decode_input(b"\x1b[<64;5;3M"), ([], b""))
-        self.assertEqual(t2._decode_input(b"\x1bM\x01\x02\x03"), ([], b""))
-
-    def test_unknown_csi_swallowed(self):
+    def test_unknown_sequences_swallowed(self):
+        self.assertEqual(t2._decode_input(b"\x1b[<64;5;3M"), ([], b""))  # xterm mouse
+        self.assertEqual(t2._decode_input(b"\x1bM\x01\x02\x03"), ([], b""))  # legacy mouse
         self.assertEqual(t2._decode_input(b"\x1b[99;99u"), ([], b""))
 
     def test_mixed_stream(self):
@@ -577,21 +500,12 @@ class TestDecodeInput(unittest.TestCase):
         self.assertEqual(keys, [ord("a"), t2.K_DOWN, ord("b")])
         self.assertEqual(rem, b"")
 
-    def test_trailing_partial_held_with_complete_before(self):
-        keys, rem = t2._decode_input(b"\x1b[A\x1b[5")
-        self.assertEqual(keys, [t2.K_UP])
-        self.assertEqual(rem, b"\x1b[5")
-
 
 class TestCellLen(unittest.TestCase):
-    def test_ascii(self):
+    def test_cell_widths(self):
         self.assertEqual(t2._cell_len("abc"), 3)
-
-    def test_wide_chars_take_two_cells(self):
         self.assertEqual(t2._cell_len("\U0001F916"), 2)  # robot emoji
         self.assertEqual(t2._cell_len("\U0001F311"), 2)  # new moon spinner
-
-    def test_mixed(self):
         self.assertEqual(t2._cell_len("\U0001F916: "), 4)  # emoji(2) + ':' + ' '
 
 

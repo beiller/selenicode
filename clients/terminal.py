@@ -46,6 +46,7 @@ K_UP = 259
 K_DOWN = 260
 K_LEFT = 261
 K_RIGHT = 262
+_BLOCK_GAP = 1  # blank rows between scrollback sections (thinking/message/tool)
 K_HOME = 270
 K_END = 271
 K_PPAGE = 339
@@ -174,11 +175,7 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
     """Build the full screen as rows of (text, style) segments. Pure."""
     input_lines = state.input_buf.split("\n") if state.input_buf else [""]
     view_h = max(1, height - 1 - _input_block_height(input_lines, width))
-    all_lines: list[list[tuple[str, int]]] = []
-    for block in state.blocks:
-        all_lines.extend(_block_lines(state, block, width))
-    if state.active is not None:
-        all_lines.extend(_block_lines(state, state.active, width))
+    all_lines = _scrollback_rows(state, width)
 
     total = len(all_lines)
     bottom = max(0, total - view_h)
@@ -307,12 +304,22 @@ def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[st
     return "", ""
 
 
+def _scrollback_rows(state: UIState, width: int) -> list[list[tuple[str, int]]]:
+    """All scrollback rows in order, with a blank separator between blocks.
+    Single source of truth for both count_lines and render_frame so the two
+    can never desync."""
+    all_lines: list[list[tuple[str, int]]] = []
+    blocks = state.blocks + ([state.active] if state.active is not None else [])
+    for block in blocks:
+        if all_lines:
+            all_lines.extend([[("", STY_PLAIN)] for _ in range(_BLOCK_GAP)])
+        all_lines.extend(_block_lines(state, block, width))
+    return all_lines
+
+
 def count_lines(state: UIState, width: int) -> int:
     """Total wrapped content lines (viewport area only, pinned bars excluded)."""
-    n = sum(len(_block_lines(state, b, width)) for b in state.blocks)
-    if state.active is not None:
-        n += len(_block_lines(state, state.active, width))
-    return n
+    return len(_scrollback_rows(state, width))
 
 
 def _scroll(state: UIState, delta: int, total: int, view_h: int) -> None:
