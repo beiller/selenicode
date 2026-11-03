@@ -49,13 +49,21 @@ class UsageReport:
 
 
 @dataclass(frozen=True)
+class Error:
+    """Outbound: a core failure surfaced to the client (see main.report_error)."""
+
+    user_id: str
+    text: str
+
+
+@dataclass(frozen=True)
 class History:
     """Outbound: full message history for a resumed session (terminal only)."""
 
     messages: list[dict]
 
 
-Event = UserMessage | Interrupt | Shutdown | Token | TurnDone | UsageReport | History
+Event = UserMessage | Interrupt | Shutdown | Token | TurnDone | UsageReport | Error | History
 
 
 class Bus:

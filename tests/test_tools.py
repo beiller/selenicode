@@ -51,15 +51,13 @@ class TestReadFile(FileToolsBase):
     def test_offset_out_of_range(self):
         self.write_raw("one\n")
         r = ok(read_file(self.path, offset=99))
-        self.assertEqual(r["status"], "error")
-        self.assertIn("out of range", r["description"])
+        self.assertIn("out of range", r["error"])
 
     def test_missing_file_with_suggestion(self):
         self.write_raw("x\n")
         r = ok(read_file(self.path + ".extra"))
-        self.assertEqual(r["status"], "error")
-        self.assertIn("Did you mean", r["description"])
-        self.assertIn(self.path, r["description"])
+        self.assertIn("Did you mean", r["error"])
+        self.assertIn(self.path, r["error"])
 
     def test_directory_listing(self):
         os.makedirs(os.path.join(self.dir.name, "subdir"))
@@ -73,8 +71,7 @@ class TestReadFile(FileToolsBase):
         with open(os.path.join(self.dir.name, "blob.bin"), "wb") as f:
             f.write(b"\x00\x01\x02data")
         r = ok(read_file(os.path.join(self.dir.name, "blob.bin")))
-        self.assertEqual(r["status"], "error")
-        self.assertIn("binary", r["description"].lower())
+        self.assertIn("binary", r["error"].lower())
 
     def test_long_line_truncated(self):
         self.write_raw("start\n" + "x" * 2500 + "\nend\n")
@@ -151,7 +148,6 @@ class TestEditFile(FileToolsBase):
     def test_multiple_matches_fails(self):
         self.write_raw("dup\ndup\n")
         r = ok(edit_file(self.path, "dup", "x"))
-        self.assertFalse(r["success"])
         self.assertIn("multiple", r["error"].lower())
 
     def test_replace_all(self):
@@ -163,23 +159,19 @@ class TestEditFile(FileToolsBase):
     def test_not_found(self):
         self.write_raw("present\n")
         r = ok(edit_file(self.path, "absent", "x"))
-        self.assertFalse(r["success"])
         self.assertIn("could not find", r["error"].lower())
 
     def test_identical_strings_rejected(self):
         self.write_raw("same\n")
         r = ok(edit_file(self.path, "same", "same"))
-        self.assertFalse(r["success"])
         self.assertIn("identical", r["error"].lower())
 
     def test_missing_file(self):
         r = ok(edit_file(os.path.join(self.dir.name, "nope.txt"), "a", "b"))
-        self.assertFalse(r["success"])
         self.assertIn("not found", r["error"].lower())
 
     def test_directory_rejected(self):
         r = ok(edit_file(self.dir.name, "a", "b"))
-        self.assertFalse(r["success"])
         self.assertIn("directory", r["error"].lower())
 
     def test_empty_old_string_replaces_whole_file(self):

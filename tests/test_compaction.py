@@ -94,15 +94,17 @@ class TestHeadTail(CompactionBase):
         self.assertEqual(len([m for m in messages if m.get("compaction_marker")]), 1)
         self.assertEqual(messages[1]["content"], "SUMMARY2")
 
-    def test_summarize_failure_keeps_messages(self):
+    def test_summarize_failure_raises_and_keeps_messages(self):
         async def failing(base_url, model, system_prompt, msgs):
-            return None
+            raise ConnectionError("server busy")
 
         with mock.patch.object(compaction, "summarize_messages", failing):
-            asyncio.run(compaction.compact_messages("http://localhost:1", messages := [
+            messages = [
                 {"role": "user", "content": "U" * 3000},
                 {"role": "assistant", "content": "A" * 3000},
-            ], "sess", 1000, "test-model"))
+            ]
+            with self.assertRaises(ConnectionError):
+                asyncio.run(compaction.compact_messages("http://localhost:1", messages, "sess", 1000, "test-model"))
         self.assertEqual(messages[0]["content"], "U" * 3000)
         self.assertFalse(any(m.get("compaction_marker") for m in messages))
 

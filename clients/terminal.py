@@ -29,7 +29,7 @@ import time
 import unicodedata
 import uuid
 
-from bus import Bus, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+from bus import Bus, Error, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
 
 logger = logging.getLogger()
 
@@ -61,18 +61,20 @@ STY_YOU = 2
 STY_TOOL = 3
 STY_INFO = 4
 STY_STATUS = 5
+STY_ERROR = 6
 
 _ROLE_STYLE = {
     "thinking": STY_DIM,
     "assistant": STY_PLAIN,
     "tool": STY_TOOL,
     "info": STY_INFO,
-    "error": STY_INFO,
+    "error": STY_ERROR,
 }
 _ROLE_PREFIX = {
     "thinking": "(thinking) ",
     "assistant": "\U0001F916: ",
     "user": "You: ",
+    "error": "ERROR: ",
 }
 
 
@@ -376,6 +378,9 @@ def apply_event(state: UIState, event) -> None:
     match event:
         case Token(_, role, text, chunk):
             apply_token(state, role, text, chunk)
+        case Error(_, text):
+            _finalize_active(state)
+            state.blocks.append(Block("error", "ERROR: ", text, STY_ERROR))
         case TurnDone(_):
             _finalize_active(state)
             state.busy = False
@@ -421,6 +426,7 @@ def _curses_setup() -> "curses._CursesWindow":
         curses.init_pair(2, curses.COLOR_MAGENTA, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_GREEN, -1)
+        curses.init_pair(5, curses.COLOR_RED, -1)
         _STYLE_ATTRS.update(
             {
                 STY_PLAIN: 0,
@@ -431,10 +437,11 @@ def _curses_setup() -> "curses._CursesWindow":
                 STY_INFO: curses.A_BOLD | curses.color_pair(3),
                 # bold green: UI chrome, distinct from the cyan "You:" text.
                 STY_STATUS: curses.A_BOLD | curses.color_pair(4),
+                STY_ERROR: curses.A_BOLD | curses.color_pair(5),
             }
         )
     except curses.error:
-        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD})
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD})
     # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
     # our decoder instead of raising SIGINT. Input is read from stdin directly;
     # getch is never used.

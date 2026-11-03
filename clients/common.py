@@ -3,7 +3,7 @@
 import asyncio
 import time
 
-from bus import Bus, Token
+from bus import Bus, Error, Token
 
 
 def rate_limit(calls, period=10):
@@ -44,16 +44,21 @@ def async_rate_limit(calls, period=10):
     return decorator
 
 
-async def consume_tokens(bus: Bus, on_complete) -> None:
+async def consume_tokens(bus: Bus, on_complete, on_error=None) -> None:
     """Accumulate streamed Token chunks per user.
 
     Calls ``await on_complete(user_id, role, text)`` for every complete
     (chunk=False) message, including empty ones. Thinking tokens and
-    non-Token events are ignored.
+    non-Token events are ignored, except Error events which go to on_error
+    when provided.
     """
     pending: dict[str, str] = {}
     while True:
         event = await bus.outbound.get()
+        if isinstance(event, Error):
+            if on_error is not None:
+                await on_error(event.user_id, event.text)
+            continue
         if not isinstance(event, Token) or event.role == "thinking":
             continue
         if event.chunk:

@@ -10,6 +10,7 @@ import re
 import urllib.request
 
 from main_types import FunctionParameters, Tool, ToolHandler
+from retry import retry_fibonacci
 from search import search as _search
 
 
@@ -116,11 +117,11 @@ def change_working_directory(directory: str) -> str:
     target = directory if os.path.isabs(directory) else os.path.abspath(directory)
     try:
         if not os.path.isdir(target):
-            return json.dumps({"success": False, "error": f"Not a directory: {target}"})
+            return json.dumps({"error": f"Not a directory: {target}"})
         os.chdir(target)
         return json.dumps({"success": True, "working_directory": os.getcwd()})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        return json.dumps({"error": str(e)})
 
 
 DEFAULT_READ_LIMIT = 2000
@@ -203,18 +204,18 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
         msg = f"File not found: {filepath}"
         if suggestions:
             msg += "\n\nDid you mean one of these?\n" + "\n".join(suggestions)
-        return json.dumps({"status": "error", "description": msg})
+        return json.dumps({"error": msg})
 
     if offset is not None:
         try:
             offset = int(offset)
         except (TypeError, ValueError):
-            return json.dumps({"status": "error", "description": f"Invalid offset: {offset!r}"})
+            return json.dumps({"error": f"Invalid offset: {offset!r}"})
     if limit is not None:
         try:
             limit = int(limit)
         except (TypeError, ValueError):
-            return json.dumps({"status": "error", "description": f"Invalid limit: {limit!r}"})
+            return json.dumps({"error": f"Invalid limit: {limit!r}"})
     start = (offset or 1) - 1
     count_limit = limit or DEFAULT_READ_LIMIT
 
@@ -222,7 +223,7 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
         try:
             entries = sorted(os.listdir(filepath))
         except OSError as e:
-            return json.dumps({"status": "error", "description": str(e)})
+            return json.dumps({"error": str(e)})
         listed = []
         for name in entries:
             full = os.path.join(filepath, name)
@@ -251,10 +252,10 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
         with open(filepath, "rb") as fh:
             sample = fh.read(SAMPLE_BYTES)
     except OSError as e:
-        return json.dumps({"status": "error", "description": str(e)})
+        return json.dumps({"error": str(e)})
 
     if _is_binary_file(filepath, sample):
-        return json.dumps({"status": "error", "description": f"Cannot read binary file: {filepath}"})
+        return json.dumps({"error": f"Cannot read binary file: {filepath}"})
 
     raw = []
     total_lines = 0
@@ -285,12 +286,10 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
                     more = True
                     done = True
     except OSError as e:
-        return json.dumps({"status": "error", "description": str(e)})
+        return json.dumps({"error": str(e)})
 
     if total_lines < (offset or 1) and not (total_lines == 0 and (offset or 1) == 1):
-        return json.dumps(
-            {"status": "error", "description": f"Offset {offset} is out of range for this file ({total_lines} lines)"}
-        )
+        return json.dumps({"error": f"Offset {offset} is out of range for this file ({total_lines} lines)"})
 
     output = [f"<path>{filepath}</path>", "<type>file</type>", "<content>"]
     output += [f"{i + (offset or 1)}: {line}" for i, line in enumerate(raw)]
@@ -362,7 +361,7 @@ def write_file(file_path: str, file_content: str) -> str:
 
         return json.dumps({"success": True, "diff": diff})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        return json.dumps({"error": str(e)})
 
 
 def _detect_line_ending(text: str) -> str:
@@ -495,13 +494,11 @@ def edit_file(file_path: str, old_string: str, new_string: str, replace_all: boo
     filepath = file_path if os.path.isabs(file_path) else os.path.abspath(file_path)
     try:
         if old_string == new_string:
-            return json.dumps(
-                {"success": False, "error": "No changes to apply: old_string and new_string are identical."}
-            )
+            return json.dumps({"error": "No changes to apply: old_string and new_string are identical."})
         if not os.path.exists(filepath):
-            return json.dumps({"success": False, "error": f"File {filepath} not found"})
+            return json.dumps({"error": f"File {filepath} not found"})
         if os.path.isdir(filepath):
-            return json.dumps({"success": False, "error": f"Path is a directory, not a file: {filepath}"})
+            return json.dumps({"error": f"Path is a directory, not a file: {filepath}"})
 
         with open(filepath, "rb") as fh:
             raw_bytes = fh.read()
@@ -525,7 +522,7 @@ def edit_file(file_path: str, old_string: str, new_string: str, replace_all: boo
             try:
                 content_new = _replace_in_content(content_old, old, replacement, bool(replace_all))
             except ValueError as e:
-                return json.dumps({"success": False, "error": str(e)})
+                return json.dumps({"error": str(e)})
 
         with open(filepath, "w", encoding="utf-8") as fh:
             if desired_bom:
@@ -547,9 +544,10 @@ def edit_file(file_path: str, old_string: str, new_string: str, replace_all: boo
 
         return json.dumps({"success": True, "diff": diff, "additions": additions, "deletions": deletions})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        return json.dumps({"error": str(e)})
 
 
+@retry_fibonacci()
 def load_model(model_name: str) -> str:
     """Load a specific model into llama-server router mode via its API.
 
@@ -563,23 +561,17 @@ def load_model(model_name: str) -> str:
         JSON string with success status and details
     """
     base_url = os.getenv("LLAMA_BASE_URL")
+    url = f"{base_url}/models/load"
+    data = json.dumps({"model": model_name}).encode("utf-8")
 
-    try:
-        url = f"{base_url}/models/load"
-        data = json.dumps({"model": model_name}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
 
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-
-        with urllib.request.urlopen(req, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return json.dumps({"success": True, "model": model_name, "details": result})
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else "Unknown error"
-        return json.dumps({"success": False, "http_status": e.code, "error": error_body})
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    with urllib.request.urlopen(req, timeout=60) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return json.dumps({"success": True, "model": model_name, "details": result})
 
 
+@retry_fibonacci()
 def unload_model(model_name: str) -> str:
     """Unload a specific model from llama-server router mode via its API.
 
@@ -592,37 +584,30 @@ def unload_model(model_name: str) -> str:
         JSON string with success status and details
     """
     base_url = os.getenv("LLAMA_BASE_URL")
-    try:
-        url = f"{base_url}/models/unload"
-        data = json.dumps({"model": model_name}).encode("utf-8")
+    url = f"{base_url}/models/unload"
+    data = json.dumps({"model": model_name}).encode("utf-8")
 
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
 
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return json.dumps({"success": True, "model": model_name, "details": result})
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else "Unknown error"
-        return json.dumps({"success": False, "http_status": e.code, "error": error_body})
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return json.dumps({"success": True, "model": model_name, "details": result})
 
 
+@retry_fibonacci()
 def get_loaded_model() -> str | None:
     """Return the loaded model name, or None if no model is currently loaded."""
     base_url = os.getenv("LLAMA_BASE_URL")
-    try:
-        req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            for model in result.get("data", []):
-                if model.get("status", {}).get("value") == "loaded":
-                    return model["id"]
-            return None
-    except Exception:
+    req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        for model in result.get("data", []):
+            if model.get("status", {}).get("value") == "loaded":
+                return model["id"]
         return None
 
 
+@retry_fibonacci()
 def list_models() -> str:
     """List all available models in llama-server router mode.
 
@@ -633,16 +618,13 @@ def list_models() -> str:
         JSON string with list of models and their status
     """
     base_url = os.getenv("LLAMA_BASE_URL")
-    try:
-        url = f"{base_url}/models"
+    url = f"{base_url}/models"
 
-        req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method="GET")
 
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return json.dumps(result)
 
 
 def load_skills(skills_dir: str | pathlib.Path) -> tuple[list[Tool], dict[str, ToolHandler]]:

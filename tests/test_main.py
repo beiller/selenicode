@@ -219,12 +219,12 @@ class TestSessionWipeGuard(unittest.TestCase):
 
     def test_compact_refuses_to_wipe_nonempty_session(self):
         status, written = self._call_compact("wrong_user")
-        self.assertTrue(status["status"].startswith("error"))
+        self.assertIn("refusing", status.get("error", ""))
         self.assertEqual(written, [])
 
     def test_reset_refuses_to_wipe_nonempty_session(self):
         status, written = self._call_reset("wrong_user")
-        self.assertTrue(status["status"].startswith("error"))
+        self.assertIn("refusing", status.get("error", ""))
         self.assertEqual(written, [])
 
     def test_compact_proceeds_when_memory_has_messages(self):
@@ -233,7 +233,7 @@ class TestSessionWipeGuard(unittest.TestCase):
             status, written = self._call_compact("good_user")
         finally:
             main.user_registry.pop("good_user", None)
-        self.assertFalse(status["status"].startswith("error"))
+        self.assertNotIn("error", status)
         self.assertEqual(len(written), 1)
 
     def test_reset_proceeds_when_memory_has_messages(self):
@@ -242,7 +242,7 @@ class TestSessionWipeGuard(unittest.TestCase):
             status, written = self._call_reset("good_user")
         finally:
             main.user_registry.pop("good_user", None)
-        self.assertFalse(status["status"].startswith("error"))
+        self.assertNotIn("error", status)
         self.assertEqual(len(written), 1)
 
     def test_guard_allows_empty_write_when_disk_missing(self):
@@ -258,8 +258,73 @@ class TestSessionWipeGuard(unittest.TestCase):
              mock.patch.object(main, "compact_messages", fake_compact), \
              mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
             status = json.loads(asyncio.run(main.compact_session("any_user", "sess1")))
-        self.assertFalse(status["status"].startswith("error"))
+        self.assertNotIn("error", status)
         self.assertEqual(len(written), 1)
+
+
+class TestErrorReporting(unittest.TestCase):
+    def _drain(self, b):
+        events = []
+        while not b.outbound.empty():
+            events.append(b.outbound.get_nowait())
+        return events
+
+    def test_report_error_posts_error_event_and_logs(self):
+        b = bus_mod.Bus()
+        with mock.patch.object(main, "bus", b), self.assertLogs(level="ERROR") as logs:
+            main.report_error("u1", "something failed", ValueError("boom"))
+        ev = b.outbound.get_nowait()
+        self.assertIsInstance(ev, bus_mod.Error)
+        self.assertEqual(ev.user_id, "u1")
+        self.assertEqual(ev.text, "something failed: boom")
+        self.assertTrue(any("boom" in line for line in logs.output))
+
+    def test_turn_exception_is_reported_and_loop_continues(self):
+        b = bus_mod.Bus()
+        calls = {"n": 0}
+
+        async def flaky_handle(text, base_url, user_id, session_id, msg_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("turn blew up")
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "handle_message", flaky_handle
+            ), mock.patch.object(main, "llama_proc", None, create=True):
+                b.post(bus_mod.UserMessage("u1", "hello", "m1"))
+                b.post(bus_mod.UserMessage("u1", "again", "m2"))
+                b.post(bus_mod.Shutdown())
+                await main.main()
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 2)
+        errors = [e for e in self._drain(b) if isinstance(e, bus_mod.Error)]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("turn blew up", errors[0].text)
+
+    def test_compact_command_error_is_reported(self):
+        b = bus_mod.Bus()
+
+        async def failing_compact(user_id="", session_id=""):
+            return json.dumps({"error": "compaction failed; context still 999 tokens"})
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "compact_session", failing_compact
+            ), mock.patch.object(main, "llama_proc", None, create=True):
+                b.post(bus_mod.UserMessage("u1", "/compact", "m1"))
+                b.post(bus_mod.Shutdown())
+                await main.main()
+
+        asyncio.run(scenario())
+        events = self._drain(b)
+        errors = [e for e in events if isinstance(e, bus_mod.Error)]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("compaction failed", errors[0].text)
+        self.assertTrue(any(isinstance(e, bus_mod.TurnDone) for e in events))
 
 
 if __name__ == "__main__":

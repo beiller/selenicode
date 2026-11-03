@@ -6,6 +6,7 @@ import aiohttp
 
 from conversation import approximate_token_count
 from main_types import Message, SessionID
+from retry import HttpError, retry_fibonacci
 
 logger = logging.getLogger()
 
@@ -226,8 +227,12 @@ def build_prompt(previous_summary: str | None) -> str:
     return "\n\n".join([anchor, SUMMARY_TEMPLATE])
 
 
-async def summarize_messages(base_url: str, model: str, system_prompt: str, messages: list[dict]) -> str | None:
-    """Send head history plus template prompt to the model; return the summary or None on failure."""
+@retry_fibonacci()
+async def summarize_messages(base_url: str, model: str, system_prompt: str, messages: list[dict]) -> str:
+    """Send head history plus template prompt to the model (one HTTP request, retried on failure).
+
+    Raises on non-200 responses and empty completions; after retries are exhausted the original
+    exception propagates so the caller's error funnel can report it."""
     body: dict = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}, *messages],
@@ -235,33 +240,34 @@ async def summarize_messages(base_url: str, model: str, system_prompt: str, mess
         "stream": True,
         "max_tokens": SUMMARY_MAX_TOKENS,
     }
-    try:
-        parts: list[str] = []
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{base_url}/v1/chat/completions",
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(sock_read=None, sock_connect=5 * 60, connect=5 * 60),
-            ) as resp:
-                async for line in resp.content:
-                    raw_line = line.decode("utf-8").strip()
-                    if not raw_line or raw_line.startswith(":"):
+    parts: list[str] = []
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/v1/chat/completions",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(sock_read=None, sock_connect=5 * 60, connect=5 * 60),
+        ) as resp:
+            if resp.status != 200:
+                raise HttpError(resp.status, (await resp.text())[:300])
+            async for line in resp.content:
+                raw_line = line.decode("utf-8").strip()
+                if not raw_line or raw_line.startswith(":"):
+                    continue
+                if raw_line == "data: [DONE]":
+                    break
+                if raw_line.startswith("data: "):
+                    chunk = json.loads(raw_line[6:])
+                    choices = chunk.get("choices")
+                    if not choices:
                         continue
-                    if raw_line == "data: [DONE]":
-                        break
-                    if raw_line.startswith("data: "):
-                        chunk = json.loads(raw_line[6:])
-                        choices = chunk.get("choices")
-                        if not choices:
-                            continue
-                        content = choices[0].get("delta", {}).get("content")
-                        if content:
-                            parts.append(content)
-        return "".join(parts).strip() or None
-    except Exception:
-        logger.exception("summarize_messages failed")
-        return None
+                    content = choices[0].get("delta", {}).get("content")
+                    if content:
+                        parts.append(content)
+    summary = "".join(parts).strip()
+    if not summary:
+        raise RuntimeError("empty completion (model may have exhausted max_tokens on reasoning)")
+    return summary
 
 
 def find_previous_summary(messages: list[Message]) -> tuple[str | None, int | None]:
@@ -273,11 +279,13 @@ def find_previous_summary(messages: list[Message]) -> tuple[str | None, int | No
 
 async def compact_messages(
     base_url: str, messages: list[Message], session_id: SessionID, context_size: int, model: str
-) -> None:
+) -> bool:
     """Opencode-style compaction: prune old tool outputs, then replace the head with an anchored
-    structured summary (marker user message + assistant summary message) and keep the newest turns verbatim."""
+    structured summary (marker user message + assistant summary message) and keep the newest turns verbatim.
+    Returns True when a summary was applied, False when there was nothing to compact; raises when
+    summarization fails after retries."""
     if context_token_count(messages) <= compaction_target(context_size):
-        return
+        return False
 
     prune(messages, context_size)
 
@@ -285,15 +293,12 @@ async def compact_messages(
     history = messages[prev_idx + 1 :] if prev_idx is not None else messages
     head, tail = select(history, context_size)
     if not head:
-        return
+        return False
 
     model_input = [to_summary_input(m) for m in head]
     summary = await summarize_messages(
         base_url, model, SUMMARY_SYSTEM_PROMPT, model_input + [{"role": "user", "content": build_prompt(previous_summary)}]
     )
-    if not summary:
-        logger.warning("Compaction summarization failed, keeping current context")
-        return
 
     new_messages: list[Message] = [
         {"role": "user", "content": "[compaction] The conversation before this point was summarized.", "compaction_marker": True},
@@ -311,3 +316,4 @@ async def compact_messages(
 
     messages.clear()
     messages.extend(new_messages)
+    return True

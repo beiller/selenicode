@@ -93,6 +93,12 @@ async def handle_complete(user_id: str, role: str, text: str) -> None:
         status_msg_ids.pop(user_id, None)
 
 
+async def handle_error(user_id: str, text: str) -> None:
+    """Core failure: sent as a real message so it is not lost in the rolling status."""
+    for chunk in split_message(f"ERROR: {text}", 1500):
+        await send_new_message(user_id, chunk)
+
+
 def get_unique_query_id(message):
     message_id = message.id
     channel_id = message.channel.id
@@ -135,7 +141,7 @@ async def run(bus: Bus, context_size: int = 0) -> None:
     client = DiscordClient(command_prefix="!", intents=intents)
     await asyncio.gather(
         client.start(os.getenv("DISCORD_TOKEN"), reconnect=True),
-        consume_tokens(bus, handle_complete),
+        consume_tokens(bus, handle_complete, handle_error),
     )
 
 

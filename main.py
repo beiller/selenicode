@@ -54,6 +54,7 @@ logger = logging.getLogger()
 
 # Import tools from tools.py
 from download_model import download_model, search_model
+from retry import HttpError, retry_fibonacci
 from tools import (
     change_working_directory,
     conversation_search,
@@ -93,15 +94,20 @@ def load_model_and_set(model_name: str):
     CURRENT_MODEL = model_name
 
 
+@retry_fibonacci()
+def _fetch_models(base_url: str) -> list[dict]:
+    """Fetch the model list from the server (one HTTP request, retried on failure)."""
+    req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8")).get("data", [])
+
+
 def get_context_size() -> int:
     """Get the context size from llama-server or vLLM."""
     base_url = os.getenv("LLAMA_BASE_URL")
     context_size = int(os.environ.get("CTX_SIZE") or "16384")
     try:
-        req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        models = result.get("data", [])
+        models = _fetch_models(base_url)
         for preferred in (True, False):
             for model in models:
                 if preferred and model.get("id") != CURRENT_MODEL:
@@ -124,7 +130,7 @@ def get_context_size() -> int:
 # Types – Chat Completions API
 # ---------------------------------------------------------------------------
 
-from bus import Bus, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+from bus import Bus, Error, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
 from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
 from conversation import (
     approximate_token_count,
@@ -232,22 +238,43 @@ async def stream_chat_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
+    # Only the request open is retried; a mid-stream failure propagates (partial output already emitted).
+    session, resp = await _open_chat_stream(base_url, body)
+    try:
+        async for line in resp.content:
+            raw_line = line.decode("utf-8").strip()
+            if not raw_line or raw_line.startswith(":"):
+                continue
+            if raw_line == "data: [DONE]":
+                break
+            if raw_line.startswith("data: "):
+                yield json.loads(raw_line[6:])
+    finally:
+        await session.close()
+
+
+@retry_fibonacci()
+async def _open_chat_stream(
+    base_url: str, body: ChatCompletionRequest
+) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
+    """Open the streaming chat completion request (one HTTP request, retried on failure)."""
+    logger.debug(f"loading: {base_url}/v1/chat/completions")
+    session = aiohttp.ClientSession()
+    try:
+        resp = await session.post(
             f"{base_url}/v1/chat/completions",
             json=body,
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(sock_read=None, sock_connect=5 * 60, connect=5 * 60),
-        ) as resp:
-            logger.debug(f"loading: {base_url}/v1/chat/completions")
-            async for line in resp.content:
-                raw_line = line.decode("utf-8").strip()
-                if not raw_line or raw_line.startswith(":"):
-                    continue
-                if raw_line == "data: [DONE]":
-                    break
-                if raw_line.startswith("data: "):
-                    yield json.loads(raw_line[6:])
+        )
+        if resp.status != 200:
+            error_body = (await resp.text())[:300]
+            await session.close()
+            raise HttpError(resp.status, error_body)
+        return session, resp
+    except BaseException:
+        await session.close()
+        raise
 
 
 async def consume_stream(
@@ -337,6 +364,16 @@ def emit(user_id: UserID, role: str, content: str, chunk: bool = False) -> None:
     bus.outbound.put_nowait(Token(user_id, role, content, chunk))
 
 
+def report_error(user_id: UserID, message: str, exc: BaseException | None = None) -> None:
+    """Single funnel for core failures: log (with traceback when exc is given) and surface to the client."""
+    if exc is not None:
+        logger.error(f"{message}: {exc!r}", exc_info=exc)
+        bus.outbound.put_nowait(Error(user_id, f"{message}: {exc}"))
+    else:
+        logger.error(message)
+        bus.outbound.put_nowait(Error(user_id, message))
+
+
 async def execute_tool_calls(
     assistant_msg: Message, registry: dict[str, ToolHandler], user_id: UserID
 ) -> list[Message]:
@@ -352,7 +389,7 @@ async def execute_tool_calls(
         handler = registry.get(name)
         if handler is None:
             output = json.dumps({"error": f"unknown tool: {name}"})
-            emit(user_id, "error", f"Unknown tool: {name}")
+            report_error(user_id, f"Unknown tool: {name}")
         else:
             args_short = ", ".join(f"{k}={v!r}" for k, v in args.items())
             if len(args_short) > 200:
@@ -366,7 +403,7 @@ async def execute_tool_calls(
                     # (UI rendering, interrupt polling, other clients) keeps running.
                     output = await asyncio.to_thread(handler, **args)
             except Exception as e:
-                logger.exception(f"Tool {name} failed")
+                report_error(user_id, f"Tool {name} failed", e)
                 output = json.dumps({"error": f"Tool {name} raised an exception: {e}"})
         results.append(make_tool_result_message(tc["id"], output))
     return results
@@ -472,8 +509,7 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
             await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
             size = context_token_count(messages)
             if size > CONTEXT_SIZE:
-                logger.warning(f"Compaction insufficient mid-loop: {size} tokens > {CONTEXT_SIZE}, stopping turn")
-                emit(user_id, "info", f"Context still at {size} tokens after compaction, stopping turn")
+                report_error(user_id, f"Compaction insufficient mid-loop: {size} tokens > {CONTEXT_SIZE}, stopping turn")
                 return ""
 
         tools, registry = get_tools()
@@ -515,7 +551,7 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
 
         tool_counter += 1
         if tool_counter > max_calls:
-            emit(user_id, "info", "too many tool calls, giving up")
+            report_error(user_id, f"Too many tool calls ({max_calls}), giving up on this turn")
             return _finalize_assistant(assistant_msg, messages)
 
 
@@ -533,9 +569,12 @@ async def handle_message(user_input: str, base_url: str, user_id: UserID, sessio
 
         if context_token_count(messages) > compaction_trigger(CONTEXT_SIZE):
             logger.info("Compacting conversation")
-            await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
+            compacted = await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
             size = approximate_token_count(json.dumps(messages))
-            logger.info(f"Context size is {size} of {CONTEXT_SIZE}")
+            if not compacted and size > compaction_trigger(CONTEXT_SIZE):
+                report_error(user_id, f"Compaction failed; context still {size} tokens")
+            else:
+                logger.info(f"Context size is {size} of {CONTEXT_SIZE}")
 
         write_conversation(session_id, messages)
     finally:
@@ -583,7 +622,7 @@ def reset_session(user_id: UserID = "", session_id: SessionID = ""):
     messages: list[Message] = get_user_messages(user_id)
     if not _safe_to_write(session_id, messages):
         logger.error(f"Refusing to reset: in-memory list for {user_id} is empty but session {session_id} has content on disk")
-        return json.dumps({"status": "error: refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
+        return json.dumps({"error": "refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
     filepath: str = archive_conversation(session_id, messages)
     messages.clear()
     set_user_messages(user_id, messages)
@@ -597,11 +636,13 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     messages: list[Message] = get_user_messages(user_id)
     if not _safe_to_write(session_id, messages):
         logger.error(f"Refusing to compact: in-memory list for {user_id} is empty but session {session_id} has content on disk")
-        return json.dumps({"status": "error: refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
+        return json.dumps({"error": "refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
     logger.info(f"Compacting session {session_id} on request")
-    await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
+    compacted = await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
     write_conversation(session_id, messages)
     size = approximate_token_count(json.dumps(messages))
+    if not compacted and size > compaction_trigger(CONTEXT_SIZE):
+        return json.dumps({"error": f"compaction failed; context still {size} tokens"})
     return json.dumps({"status": f"Compaction complete. Context size is {size} of {CONTEXT_SIZE}"})
 
 
@@ -636,7 +677,11 @@ async def main_init() -> None:
     # emit("info", f"Chat (Ctrl-C to cancel, twice to quit) - URL: {base_url}")
 
     logger.info(f"Loading model {CURRENT_MODEL}")
-    load_model_and_set(CURRENT_MODEL)
+    try:
+        load_model_and_set(CURRENT_MODEL)
+    except Exception as e:
+        # Management endpoints may not exist (e.g. vLLM); the server may already be serving the model.
+        logger.error(f"Model load at startup failed: {e!r}; continuing")
     CONTEXT_SIZE = get_context_size()
     trigger = compaction_trigger(CONTEXT_SIZE)
     target = compaction_target(CONTEXT_SIZE)
@@ -672,8 +717,16 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                         continue
                     if text.lower() == "/compact":
                         logger.info(f"/compact command from {user_id}")
-                        result = await compact_session(user_id, session_id)
-                        emit(user_id, "info", json.loads(result)["status"])
+                        try:
+                            result = json.loads(await compact_session(user_id, session_id))
+                        except Exception as e:
+                            report_error(user_id, "Compaction failed", e)
+                            bus.outbound.put_nowait(TurnDone(msg_id))
+                            continue
+                        if "error" in result:
+                            report_error(user_id, result["error"])
+                        else:
+                            emit(user_id, "info", result["status"])
                         bus.outbound.put_nowait(TurnDone(msg_id))
                         continue
                     try:
@@ -681,6 +734,9 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                     except asyncio.CancelledError:
                         logger.warning("Message handling cancelled")
                         break
+                    except Exception as e:
+                        # A failed turn must not kill the process; surface it and keep serving.
+                        report_error(user_id, "Turn failed", e)
     except asyncio.CancelledError:
         logger.warning("Main loop cancelled")
         raise

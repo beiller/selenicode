@@ -6,7 +6,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import Bus, History, Interrupt, Token, TurnDone, UserMessage
+from bus import Bus, Error, History, Interrupt, Token, TurnDone, UserMessage
+from clients.common import consume_tokens
 
 
 class TestBus(unittest.TestCase):
@@ -76,6 +77,33 @@ class TestBus(unittest.TestCase):
         b = Bus()
         with self.assertRaises(RuntimeError):
             b.post(Interrupt("u1"))
+
+
+class TestConsumeTokens(unittest.TestCase):
+    def test_error_event_routed_to_on_error(self):
+        async def scenario():
+            b = Bus()
+            errors, completes = [], []
+
+            async def on_complete(user_id, role, text):
+                completes.append((user_id, role, text))
+
+            async def on_error(user_id, text):
+                errors.append((user_id, text))
+
+            task = asyncio.create_task(consume_tokens(b, on_complete, on_error))
+            b.outbound.put_nowait(Error("u1", "boom"))
+            b.outbound.put_nowait(Token("u1", "assistant", "hi", False))
+            for _ in range(100):
+                if errors and completes:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            return errors, completes
+
+        errors, completes = asyncio.run(scenario())
+        self.assertEqual(errors, [("u1", "boom")])
+        self.assertEqual(completes, [("u1", "assistant", "hi")])
 
 
 if __name__ == "__main__":

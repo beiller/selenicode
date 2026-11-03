@@ -60,6 +60,11 @@ async def handle_complete(user_id: str, role: str, text: str) -> None:
     reactor.scheduler.execute_after(0, functools.partial(_send_lines, connection, user_id, text))
 
 
+async def handle_error(user_id: str, text: str) -> None:
+    """Core failure: prefixed so it stands out in the plain IRC stream."""
+    await handle_complete(user_id, "error", f"ERROR: {text}")
+
+
 def on_disconnect(connection, event):
     logger.info("disconnected")
 
@@ -95,7 +100,7 @@ async def run(bus: Bus, context_size: int = 0) -> None:
     connection.add_global_handler("pubmsg", on_privmsg)
 
     await asyncio.gather(
-        consume_tokens(bus, handle_complete),
+        consume_tokens(bus, handle_complete, handle_error),
         asyncio.get_event_loop().run_in_executor(None, reactor.process_forever),
     )
 
