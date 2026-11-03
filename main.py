@@ -125,12 +125,8 @@ def get_context_size() -> int:
 # Types – Chat Completions API
 # ---------------------------------------------------------------------------
 
-from bus import Bus, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
-
-if os.getenv("COMPACTION_METHOD", "v2") == "v1":
-    from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
-else:
-    from compaction_v2 import compact_messages, compaction_target, compaction_trigger, context_token_count
+from bus import Bus, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
 from conversation import (
     approximate_token_count,
     archive_conversation,
@@ -566,10 +562,28 @@ def set_user_messages(user_id: UserID, messages: list[Message]) -> None:
     user_registry[user_id] = messages
 
 
+def _safe_to_write(session_id: SessionID, messages: list[Message]) -> bool:
+    """Refuse to overwrite a non-empty on-disk conversation with an empty list.
+
+    An empty in-memory list usually means the caller passed a user_id that does
+    not match the session (e.g. the terminal uses "0"); writing it would wipe
+    the saved history."""
+    if messages:
+        return True
+    try:
+        on_disk = read_conversation(session_id)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return True  # nothing on disk to protect
+    return len(on_disk) == 0
+
+
 def reset_session(user_id: UserID = "", session_id: SessionID = ""):
     "Reset the session and chat history. Provide the Current user_id AND the session id"
     logger.info(f"Clear session for user_id {user_id}")
     messages: list[Message] = get_user_messages(user_id)
+    if not _safe_to_write(session_id, messages):
+        logger.error(f"Refusing to reset: in-memory list for {user_id} is empty but session {session_id} has content on disk")
+        return json.dumps({"status": "error: refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
     filepath: str = archive_conversation(session_id, messages)
     messages.clear()
     set_user_messages(user_id, messages)
@@ -581,6 +595,9 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     "Compact the current conversation to free context space: prune old tool outputs, replace older history with a structured summary, keep recent turns verbatim"
     base_url = os.getenv("LLAMA_BASE_URL")
     messages: list[Message] = get_user_messages(user_id)
+    if not _safe_to_write(session_id, messages):
+        logger.error(f"Refusing to compact: in-memory list for {user_id} is empty but session {session_id} has content on disk")
+        return json.dumps({"status": "error: refusing to overwrite a non-empty session with an empty message list (user_id mismatch?)"})
     logger.info(f"Compacting session {session_id} on request")
     await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
     write_conversation(session_id, messages)
@@ -711,6 +728,12 @@ async def async_main(client_type: str, session_id: str | None = None):
 
     bus.bind()
     await main_init()
+
+    if resume and client_type == "terminal":
+        try:
+            bus.outbound.put_nowait(History(read_conversation(session_id)))
+        except (OSError, ValueError) as e:
+            logger.warning(f"Could not load history for session {session_id}: {e}")
 
     init_task = asyncio.create_task(client.run(bus, CONTEXT_SIZE))
     main_task = asyncio.create_task(main(resume=resume, session_id=session_id))

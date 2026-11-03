@@ -3,281 +3,218 @@ import json
 import os
 import pathlib
 import sys
-import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import compaction
-import conversation
 
-REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "x9z2fvmh.json"
+REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "bakupte6.json"
 
 
 class CompactionBase(unittest.TestCase):
     def setUp(self):
         self.summarize_calls = []
-        self.tmp = tempfile.TemporaryDirectory()
-        self.path = pathlib.Path(self.tmp.name)
-        # Pin compaction env vars so tests are deterministic regardless of the ambient environment
         self.env_patcher = mock.patch.dict(
-            os.environ, {"COMPACTION_TRIGGER_PCT": "70", "COMPACTION_TARGET_PCT": "70"}
+            os.environ,
+            {"COMPACTION_TRIGGER_PCT": "80", "COMPACTION_TARGET_PCT": "20", "COMPACTION_TAIL_TURNS": "2"},
         )
         self.env_patcher.start()
-        self.patchers = [
-            mock.patch.object(compaction, "CONVERSATION_DIR", self.path),
-            mock.patch.object(conversation, "CONVERSATION_DIR", self.path),
-        ]
-        for p in self.patchers:
-            p.start()
 
     def tearDown(self):
-        for p in self.patchers:
-            p.stop()
         self.env_patcher.stop()
-        self.tmp.cleanup()
 
-    def run_compact(self, messages, context_size=8000, summarize=None):
-        async def stub_summarize(base_url, text, model, **kwargs):
-            self.summarize_calls.append(text)
-            return "SUMMARY"
+    def run_compact(self, messages, context_size=16384, summary="SUMMARY"):
+        async def stub(base_url, model, system_prompt, msgs):
+            self.summarize_calls.append(msgs)
+            return summary
 
-        with mock.patch.object(compaction, "summarize_text", summarize or stub_summarize):
+        with mock.patch.object(compaction, "summarize_messages", stub):
             asyncio.run(compaction.compact_messages("http://localhost:1", messages, "sess", context_size, "test-model"))
 
 
-class TestStages(CompactionBase):
-    def test_stage1_single_call_summarizes_whole_session(self):
-        big = {"role": "assistant", "content": None, "reasoning_content": "A" * 30000}
-        small = {"role": "assistant", "content": None, "reasoning_content": "B" * 10000}
-        messages = [big, small]
-        self.run_compact(messages)
-        # exactly one call, sections in chronological order
-        self.assertEqual(len(self.summarize_calls), 1)
-        self.assertIn("--- section 1 ---\n" + "A" * 30000, self.summarize_calls[0])
-        self.assertIn("--- section 2 ---\n" + "B" * 10000, self.summarize_calls[0])
-        # summary swapped into the latest thinking message, others cleared, host flagged
-        self.assertEqual(big["reasoning_content"], "")
-        self.assertEqual(small["reasoning_content"], "SUMMARY")
-        self.assertTrue(small.get("compacted_thinking"))
+class TestHeadTail(CompactionBase):
+    def test_summary_inserted_as_assistant_message_after_marker(self):
+        messages = [
+            {"role": "user", "content": "U" * 3000},
+            {"role": "assistant", "content": "A" * 3000},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        self.run_compact(messages, context_size=2000)
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertTrue(messages[0].get("compaction_marker"))
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertTrue(messages[1].get("compaction_summary"))
+        self.assertEqual(messages[1]["content"], "SUMMARY")
+        self.assertEqual(messages[2]["content"], "hi")
+        self.assertEqual(messages[3]["content"], "hello")
 
-    def test_stage1_no_call_when_total_thinking_under_2000_tokens(self):
-        boundary = {"role": "assistant", "content": None, "reasoning_content": "B" * 2000}
-        small = {"role": "assistant", "content": None, "reasoning_content": "S" * 1900}
-        messages = [boundary, small]
-        self.run_compact(messages, context_size=600)
-        self.assertEqual(len(self.summarize_calls), 0)
-        self.assertEqual(boundary["reasoning_content"], "B" * 2000)
-        self.assertEqual(small["reasoning_content"], "S" * 1900)
+    def test_tail_never_starts_with_tool_message(self):
+        messages = [
+            {"role": "user", "content": "U" * 3000},
+            {"role": "assistant", "content": "A" * 3000},
+            {"role": "user", "content": "u2"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "T" * 8000},
+            {"role": "assistant", "content": "done"},
+        ]
+        self.run_compact(messages, context_size=2000)
+        tail_start = next(i for i, m in enumerate(messages) if m.get("compaction_marker")) + 1
+        first_tail = messages[tail_start + 1]
+        self.assertNotEqual(first_tail["role"], "tool")
 
-    def test_stage1_flagged_summary_not_recompacted(self):
-        host = {"role": "assistant", "content": None, "reasoning_content": "S" * 5000, "compacted_thinking": True}
-        filler = {"role": "assistant", "content": "F" * 30000}
-        messages = [host, filler]
-        self.run_compact(messages)
-        self.assertEqual(len(self.summarize_calls), 0)
-        self.assertEqual(host["reasoning_content"], "S" * 5000)
+    def test_replay_last_user_when_in_head(self):
+        user = {"role": "user", "content": "U" * 3000}
+        messages = [user, {"role": "assistant", "content": "A" * 3000}]
+        self.run_compact(messages, context_size=1000)
+        self.assertEqual(len(messages), 3)
+        self.assertTrue(messages[0].get("compaction_marker"))
+        self.assertEqual(messages[2]["content"], "U" * 3000)
 
-    def test_stage1_summarize_failure_keeps_original_thinking(self):
-        async def failing(base_url, text, model, **kwargs):
+    def test_anchored_previous_summary_on_second_compaction(self):
+        messages = [
+            {"role": "user", "content": "U" * 3000},
+            {"role": "assistant", "content": "A" * 3000},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        self.run_compact(messages, context_size=2000, summary="SUMMARY1")
+        # New conversation growth pushes the context back over the target
+        messages.append({"role": "user", "content": "G" * 3000})
+        messages.append({"role": "assistant", "content": "g" * 3000})
+        self.run_compact(messages, context_size=2000, summary="SUMMARY2")
+        prompt = self.summarize_calls[1][-1]["content"]
+        self.assertIn("<previous-summary>\nSUMMARY1\n</previous-summary>", prompt)
+        self.assertEqual(len([m for m in messages if m.get("compaction_marker")]), 1)
+        self.assertEqual(messages[1]["content"], "SUMMARY2")
+
+    def test_summarize_failure_keeps_messages(self):
+        async def failing(base_url, model, system_prompt, msgs):
             return None
 
-        msg = {"role": "assistant", "content": None, "reasoning_content": "A" * 30000}
-        messages = [msg]
-        self.run_compact(messages, summarize=failing)
-        self.assertEqual(msg["reasoning_content"], "A" * 30000)
-
-    def test_stage2_offloads_tool_outputs_largest_first(self):
-        assistant = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "call_abc12345xyz", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}
-            ],
-        }
-        big_tool = {"role": "tool", "tool_call_id": "call_abc12345xyz", "content": "C" * 60000}
-        small_tool = {"role": "tool", "tool_call_id": "call_other123", "content": "D" * 3000}
-        messages = [assistant, big_tool, small_tool]
-        self.run_compact(messages)
-        path = self.path / "sess_run_bash_call_abc.txt"
-        self.assertTrue(path.exists())
-        text = path.read_text()
-        self.assertIn("## arguments\n{}", text)
-        self.assertIn("## result\n" + "C" * 60000, text)
-        # args side replaced with a valid JSON pointer to the same file
-        new_args = json.loads(assistant["tool_calls"][0]["function"]["arguments"])
-        self.assertIn("saved to", new_args["note"])
-        self.assertIn(str(path), new_args["note"])
-        self.assertIn("saved to", big_tool["content"])
-        self.assertIn(str(path), big_tool["content"])
-        self.assertEqual(small_tool["content"], "D" * 3000)
-
-    def test_stage2_offloads_args_and_result_to_one_file(self):
-        args = json.dumps({"command": "echo " + "x" * 5000})
-        assistant = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "call_pair1234", "type": "function", "function": {"name": "run_bash", "arguments": args}}
-            ],
-        }
-        result = {"role": "tool", "tool_call_id": "call_pair1234", "content": "R" * 500}
-        messages = [assistant, result]
-        self.run_compact(messages, context_size=1000)
-        path = self.path / "sess_run_bash_call_pai.txt"
-        self.assertTrue(path.exists())
-        text = path.read_text()
-        self.assertIn("## arguments\n" + args, text)
-        self.assertIn("## result\n" + "R" * 500, text)
-        new_args = json.loads(assistant["tool_calls"][0]["function"]["arguments"])
-        self.assertIn("saved to", new_args["note"])
-        self.assertIn(str(path), new_args["note"])
-        self.assertIn(str(path), result["content"])
-
-    def test_stage2_pair_under_threshold_untouched(self):
-        assistant = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "call_small123", "type": "function", "function": {"name": "run_bash", "arguments": json.dumps({"a": "b" * 300})}}
-            ],
-        }
-        result = {"role": "tool", "tool_call_id": "call_small123", "content": "R" * 300}
-        filler = {"role": "assistant", "content": "A" * 30000}
-        messages = [assistant, result, filler]
-        self.run_compact(messages)
-        self.assertEqual(assistant["tool_calls"][0]["function"]["arguments"], json.dumps({"a": "b" * 300}))
-        self.assertEqual(result["content"], "R" * 300)
-        self.assertFalse([f for f in self.path.iterdir() if "run_bash" in f.name])
-
-    def test_stage2_unknown_tool_call_id_uses_fallback_name(self):
-        tool = {"role": "tool", "tool_call_id": "call_other123", "content": "D" * 30000}
-        messages = [tool]
-        self.run_compact(messages)
-        path = self.path / "sess_tool_call_oth.txt"
-        self.assertTrue(path.exists())
-        self.assertEqual(path.read_text(), "## result\n" + "D" * 30000)
-
-    def test_stage3_chunk_offload_oldest_first_skips_user(self):
-        user = {"role": "user", "content": "U" * 100}
-        old = {"role": "assistant", "content": "A" * 20000}
-        recent = {"role": "assistant", "content": "B" * 20000}
-        messages = [user, old, recent]
-        self.run_compact(messages)
-        path = self.path / "sess_chunk_1.txt"
-        self.assertTrue(path.exists())
-        self.assertEqual(path.read_text(), "A" * 20000)
-        self.assertIn("saved to", old["content"])
-        self.assertEqual(recent["content"], "B" * 20000)
-        self.assertEqual(user["content"], "U" * 100)
-
-    def test_stage4_offloads_large_user_messages(self):
-        user = {"role": "user", "content": "U" * 30000}
-        assistant = {"role": "assistant", "content": "a" * 800}
-        messages = [user, assistant]
-        self.run_compact(messages)
-        chunk1 = self.path / "sess_chunk_1.txt"
-        chunk2 = self.path / "sess_chunk_2.txt"
-        self.assertTrue(chunk1.exists())
-        self.assertTrue(chunk2.exists())
-        self.assertEqual(chunk1.read_text(), "a" * 800)
-        self.assertEqual(chunk2.read_text(), "U" * 30000)
-        self.assertIn("saved to", user["content"])
+        with mock.patch.object(compaction, "summarize_messages", failing):
+            asyncio.run(compaction.compact_messages("http://localhost:1", messages := [
+                {"role": "user", "content": "U" * 3000},
+                {"role": "assistant", "content": "A" * 3000},
+            ], "sess", 1000, "test-model"))
+        self.assertEqual(messages[0]["content"], "U" * 3000)
+        self.assertFalse(any(m.get("compaction_marker") for m in messages))
 
     def test_no_compaction_when_under_target(self):
         messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
-        self.run_compact(messages)
+        self.run_compact(messages, context_size=16384)
+        self.assertEqual(self.summarize_calls, [])
         self.assertEqual(messages[0]["content"], "hello")
-        self.assertEqual(len(list(self.path.iterdir())), 0)
 
-    @unittest.skip("fallback archive is commented out in compaction.py (triggers too often)")
-    def test_fallback_archive_when_still_over_budget(self):
-        messages = [{"role": "assistant", "content": "x" * 450} for _ in range(20)]
-        self.run_compact(messages, context_size=2000)
-        archived = [f for f in self.path.iterdir() if f.name.endswith("_sess.txt")]
-        self.assertTrue(archived)
-        self.assertEqual(len(messages), 5)
-        self.assertTrue(messages[0]["content"].startswith("The previous conversation was archived to"))
-
-    def test_none_content_messages_are_safe(self):
+    def test_summary_input_drops_reasoning_and_truncates_tool_output(self):
         messages = [
-            {"role": "assistant", "content": None, "tool_calls": []},
-            {"role": "tool", "tool_call_id": "call_x", "content": None},
-            {"role": "system", "content": None},
+            {"role": "user", "content": "U" * 3000},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "R" * 5000,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "T" * 8000},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
         ]
-        self.run_compact(messages)
-        for m in messages:
-            self.assertIsNone(m["content"])
+        self.run_compact(messages, context_size=2000)
+        model_input = self.summarize_calls[0]
+        for m in model_input:
+            self.assertNotIn("reasoning_content", m)
+        tool_in = next(m for m in model_input if m.get("role") == "tool")
+        self.assertIn("[Tool output truncated for compaction: omitted 6000 chars]", tool_in["content"])
+        self.assertLessEqual(len(tool_in["content"].split("\n")[0]), 2000)
+        prompt = model_input[-1]["content"]
+        self.assertIn("## Goal", prompt)
+        self.assertIn("## Relevant Files", prompt)
 
 
-class TestThresholds(unittest.TestCase):
-    def _clean_env(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("COMPACTION_")}
-        return mock.patch.dict(os.environ, env, clear=True)
+class TestPrune(CompactionBase):
+    def _prune_fixture(self, old_size):
+        messages = [
+            {"role": "user", "content": "u1"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "T" * old_size},
+            {"role": "user", "content": "u2"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "T" * 8000},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+        return messages, messages[2], messages[5]
 
-    def test_trigger_and_target_default_pct(self):
-        with self._clean_env():
-            self.assertEqual(compaction.compaction_trigger(1000), 800)
-            self.assertEqual(compaction.compaction_target(1000), 200)
+    def test_prune_erases_old_tool_outputs(self):
+        # Old output (3000 tokens) exceeds the 25% protect budget (2500 of 10000) and frees more than the 10% minimum
+        messages, old_tool, new_tool = self._prune_fixture(12000)
+        self.run_compact(messages, context_size=10000)
+        self.assertEqual(old_tool["content"], compaction.PRUNED_TOOL_NOTE)
+        self.assertEqual(new_tool["content"], "T" * 8000)
 
-    def test_trigger_and_target_respect_env(self):
-        with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "80", "COMPACTION_TARGET_PCT": "20"}):
-            self.assertEqual(compaction.compaction_trigger(1000), 800)
-            self.assertEqual(compaction.compaction_target(1000), 200)
+    def test_prune_skips_when_freed_below_minimum(self):
+        messages, old_tool, _ = self._prune_fixture(400)
+        self.run_compact(messages, context_size=10000)
+        self.assertEqual(old_tool["content"], "T" * 400)
 
-    def test_pct_invalid_falls_back_to_default(self):
-        with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "abc"}):
-            self.assertEqual(compaction.compaction_trigger(1000), 800)
 
-    def test_pct_out_of_range_is_clamped(self):
-        with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "0", "COMPACTION_TARGET_PCT": "150"}):
-            self.assertEqual(compaction.compaction_trigger(1000), 10)
-            self.assertEqual(compaction.compaction_target(1000), 1000)
+class TestBudget(CompactionBase):
+    def test_preserve_recent_budget_clamps(self):
+        with mock.patch.dict(os.environ, {"COMPACTION_TARGET_PCT": "50"}):
+            self.assertEqual(compaction.preserve_recent_budget(16384), 4096)
+        with mock.patch.dict(os.environ, {"COMPACTION_TARGET_PCT": "20"}):
+            self.assertEqual(compaction.preserve_recent_budget(16384), 3276)
+        self.assertEqual(compaction.preserve_recent_budget(1_000_000), 8000)
 
 
 class TestRealConversation(CompactionBase):
-    def test_compact_real_4mb_conversation(self):
+    def test_compact_bakupte6_conversation(self):
         with open(REAL_CONVERSATION) as f:
             messages = json.load(f)
-        # 5 messages, one 3.28MB tool output; ~1M tokens at context_size=1M, target 700K
-        self.assertGreater(compaction.context_token_count(messages), compaction.compaction_target(1_000_000))
-        self.run_compact(messages, context_size=1_000_000)
-        # No reasoning content in this file, so stage 1 must not call the model
-        self.assertEqual(self.summarize_calls, [])
-        # Stage 2 offloads the 3.28MB run_bash output (largest first), then stops under target
-        offloaded = [f for f in self.path.iterdir() if f.name.endswith(".txt")]
-        self.assertEqual(len(offloaded), 1)
-        big_file = offloaded[0]
-        self.assertIn("run_bash", big_file.name)
-        self.assertGreater(big_file.stat().st_size, 3_000_000)
-        # The big tool message is replaced with a pointer; the small one (3991 chars) is untouched
-        big_tool = next(m for m in messages if "saved to" in (m.get("content") or ""))
-        self.assertIn(str(big_file), big_tool["content"])
-        small_tool = next(m for m in messages if m.get("role") == "tool" and "saved to" not in (m.get("content") or ""))
-        self.assertEqual(len(small_tool["content"]), 3991)
-        # No chunk offloads needed after stage 2
-        self.assertFalse([f for f in self.path.iterdir() if "_chunk_" in f.name])
-        self.assertLessEqual(compaction.context_token_count(messages), compaction.compaction_target(1_000_000))
+        # ~144k tokens, so a 500k context (20% target = 100k) is needed to trigger
+        context_size = 500_000
+        self.assertGreater(compaction.context_token_count(messages), compaction.compaction_target(context_size))
+        original_last = messages[-1]
+        self.run_compact(messages, context_size=context_size)
 
+        marker_idx = next(i for i, m in enumerate(messages) if m.get("compaction_marker"))
+        self.assertEqual(marker_idx, 0)
+        self.assertTrue(messages[1].get("compaction_summary"))
+        tail = messages[2:]
+        self.assertGreater(len(tail), 0)
+        self.assertLessEqual(compaction.context_token_count(tail), compaction.preserve_recent_budget(context_size))
+        self.assertIs(tail[-1], original_last)
+        self.assertNotEqual(tail[0]["role"], "tool")
+        self.assertLessEqual(
+            compaction.context_token_count(messages), compaction.compaction_target(context_size) + 4096
+        )
 
-class TestChunkNumbering(CompactionBase):
-    def test_chunk_numbers_continue_across_compactions(self):
-        def big_messages(tag):
-            return [{"role": "assistant", "content": tag * 20000} for _ in range(3)]
-
-        first = big_messages("A")
-        self.run_compact(first)
-        self.assertTrue((self.path / "sess_chunk_1.txt").exists())
-        self.assertTrue((self.path / "sess_chunk_2.txt").exists())
-        chunk1_content = (self.path / "sess_chunk_1.txt").read_text()
-
-        second = big_messages("B")
-        self.run_compact(second)
-        new_chunks = sorted(f.name for f in self.path.iterdir() if "_chunk_" in f.name)
-        self.assertIn("sess_chunk_3.txt", new_chunks)
-        # Earlier chunks are not overwritten
-        self.assertEqual((self.path / "sess_chunk_1.txt").read_text(), chunk1_content)
+    def test_recompact_bakupte6_anchors_on_previous_summary(self):
+        with open(REAL_CONVERSATION) as f:
+            messages = json.load(f)
+        context_size = 500_000
+        self.run_compact(messages, context_size=context_size, summary="SUMMARY1")
+        # New conversation growth pushes the context back over the target
+        messages.append({"role": "user", "content": "G" * 400_000})
+        messages.append({"role": "assistant", "content": "g" * 400_000})
+        self.run_compact(messages, context_size=context_size, summary="SUMMARY2")
+        prompt = self.summarize_calls[1][-1]["content"]
+        self.assertIn("<previous-summary>\nSUMMARY1\n</previous-summary>", prompt)
+        self.assertEqual(len([m for m in messages if m.get("compaction_marker")]), 1)
 
 
 if __name__ == "__main__":

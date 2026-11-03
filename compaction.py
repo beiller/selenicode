@@ -4,26 +4,67 @@ import os
 
 import aiohttp
 
-from conversation import CONVERSATION_DIR, approximate_token_count
+from conversation import approximate_token_count
 from main_types import Message, SessionID
 
 logger = logging.getLogger()
 
-THINKING_SESSION_MIN_TOKENS = 2000
-THINKING_NOISE_FLOOR_CHARS = 100
-THINKING_INPUT_MAX_CHARS = 150_000
-TOOL_OUTPUT_MIN_CHARS = 700
-CHUNK_MIN_CHARS = 700
-USER_CHUNK_MIN_CHARS = 700
+DEFAULT_TAIL_TURNS = 2
+MIN_PRESERVE_RECENT_TOKENS = 2_000
+MAX_PRESERVE_RECENT_TOKENS = 8_000
+TOOL_OUTPUT_MAX_CHARS = 2_000
+SUMMARY_MAX_TOKENS = 4_096
+PRUNE_PROTECT_RATIO = 0.25
+PRUNE_MINIMUM_RATIO = 0.10
+PRUNED_TOOL_NOTE = "[Old tool result content cleared]"
+
 SUMMARY_SYSTEM_PROMPT = (
-    "Summarize this thinking/reasoning section of a coding assistant. "
-    "Preserve key decisions, findings, file paths, and next steps. Terse bullets, no prose."
+    "You are an anchored context summarization assistant for coding sessions. "
+    "Summarize only the conversation history you are given. The newest turns may be kept verbatim "
+    "outside your summary, so focus on the older context that still matters for continuing the work. "
+    "If the prompt includes a <previous-summary> block, treat it as the current anchored summary. "
+    "Update it with the new history by preserving still-true details, removing stale details, and merging in new facts. "
+    "Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths "
+    "and identifiers when known, and prefer terse bullets over paragraphs. Do not answer the conversation itself. "
+    "Do not mention that you are summarizing, compacting, or merging context."
 )
-THINKING_SESSION_SYSTEM_PROMPT = (
-    "You are given all thinking/reasoning sections from a coding assistant session, in order. "
-    "Produce ONE condensed summary of the whole session's reasoning: key decisions, findings, "
-    "file paths, open questions, next steps. Terse bullets, max 15 bullets."
-)
+
+SUMMARY_TEMPLATE = """Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+<template>
+## Goal
+- [single-sentence task summary]
+
+## Constraints & Preferences
+- [user constraints, preferences, specs, or "(none)"]
+
+## Progress
+### Done
+- [completed work or "(none)"]
+
+### In Progress
+- [current work or "(none)"]
+
+### Blocked
+- [blockers or "(none)"]
+
+## Key Decisions
+- [decision and why, or "(none)"]
+
+## Next Steps
+- [ordered next actions or "(none)"]
+
+## Critical Context
+- [important technical facts, errors, open questions, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+</template>
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, commands, error strings, and identifiers when known.
+- Do not mention the summary process or that context was compacted."""
 
 
 def _pct(env_var: str, default: float) -> float:
@@ -45,7 +86,7 @@ def compaction_trigger(context_size: int) -> int:
 
 
 def compaction_target(context_size: int) -> int:
-    """Shrink-to target: stages stop once context is at or below this (default: 20%)."""
+    """Shrink-to target: compaction stops once context is at or below this (default: 20%)."""
     return int(context_size * _pct("COMPACTION_TARGET_PCT", 20.0) / 100)
 
 
@@ -53,21 +94,147 @@ def context_token_count(messages: list[Message]) -> int:
     return approximate_token_count(json.dumps(messages))
 
 
-async def summarize_text(
-    base_url: str, text: str, model: str, system_prompt: str = SUMMARY_SYSTEM_PROMPT, max_tokens: int | None = None
-) -> str | None:
-    """Send a single text to the model for summarization; return the summary or None on failure."""
+def preserve_recent_budget(context_size: int) -> int:
+    budget = min(MAX_PRESERVE_RECENT_TOKENS, max(MIN_PRESERVE_RECENT_TOKENS, int(context_size * 0.25)))
+    return min(budget, compaction_target(context_size))
+
+
+def _tail_turns() -> int:
+    raw = os.environ.get("COMPACTION_TAIL_TURNS", str(DEFAULT_TAIL_TURNS))
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning(f"Invalid COMPACTION_TAIL_TURNS={raw!r}, using default {DEFAULT_TAIL_TURNS}")
+        return DEFAULT_TAIL_TURNS
+    return max(0, n)
+
+
+def turns(messages: list[Message]) -> list[list[int]]:
+    result = []
+    for i, m in enumerate(messages):
+        if m.get("role") != "user" or m.get("compaction_marker"):
+            continue
+        result.append([i, len(messages)])
+    for i in range(len(result) - 1):
+        result[i][1] = result[i + 1][0]
+    return result
+
+
+def _split_turn(messages: list[Message], start: int, end: int, budget: int) -> int | None:
+    for i in range(start + 1, end):
+        if messages[i].get("role") == "tool":
+            continue
+        if context_token_count(messages[i:end]) <= budget:
+            return i
+    return None
+
+
+def select(messages: list[Message], context_size: int) -> tuple[list[Message], list[Message]]:
+    """Split history into (head, tail): the newest turns that fit the preserve budget are kept verbatim."""
+    limit = _tail_turns()
+    if limit <= 0:
+        return messages, []
+    all_turns = turns(messages)
+    if not all_turns:
+        return messages, []
+    budget = preserve_recent_budget(context_size)
+    recent = all_turns[-limit:]
+    total = 0
+    keep_start: int | None = None
+    for i in range(len(recent) - 1, -1, -1):
+        t_start, t_end = recent[i]
+        size = context_token_count(messages[t_start:t_end])
+        if total + size <= budget:
+            total += size
+            keep_start = t_start
+            continue
+        split = _split_turn(messages, t_start, t_end, budget - total)
+        if split is not None:
+            keep_start = split
+        break
+    if keep_start is None or keep_start == 0:
+        return messages, []
+    return messages[:keep_start], messages[keep_start:]
+
+
+def prune(messages: list[Message], context_size: int) -> None:
+    """Erase old tool outputs to free space; the two newest user turns are protected."""
+    protect = int(context_size * PRUNE_PROTECT_RATIO)
+    minimum = int(context_size * PRUNE_MINIMUM_RATIO)
+    total = 0
+    freed = 0
+    to_prune: list[Message] = []
+    user_turns = 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "user":
+            user_turns += 1
+        if user_turns < 2:
+            continue
+        if m.get("compaction_summary"):
+            break
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content") or ""
+        if not content or PRUNED_TOOL_NOTE in content:
+            continue
+        est = approximate_token_count(content)
+        total += est
+        if total <= protect:
+            continue
+        freed += est
+        to_prune.append(m)
+    if freed > minimum:
+        for m in to_prune:
+            m["content"] = PRUNED_TOOL_NOTE
+
+
+def _truncate_tool_output(text: str) -> str:
+    if len(text) <= TOOL_OUTPUT_MAX_CHARS:
+        return text
+    return f"{text[:TOOL_OUTPUT_MAX_CHARS]}\n[Tool output truncated for compaction: omitted {len(text) - TOOL_OUTPUT_MAX_CHARS} chars]"
+
+
+def to_summary_input(m: Message) -> dict:
+    out: dict = {"role": m["role"]}
+    content = m.get("content")
+    if m["role"] == "tool" and content:
+        content = _truncate_tool_output(content)
+    if content is not None:
+        out["content"] = content
+    if m["role"] == "assistant" and m.get("tool_calls"):
+        out["tool_calls"] = m["tool_calls"]
+    if m["role"] == "tool" and m.get("tool_call_id"):
+        out["tool_call_id"] = m["tool_call_id"]
+    return out
+
+
+def build_prompt(previous_summary: str | None) -> str:
+    anchor = (
+        "\n".join(
+            [
+                "Update the anchored summary below using the conversation history above.",
+                "Preserve still-true details, remove stale details, and merge in the new facts.",
+                "<previous-summary>",
+                previous_summary,
+                "</previous-summary>",
+            ]
+        )
+        if previous_summary
+        else "Create a new anchored summary from the conversation history above."
+    )
+    return "\n\n".join([anchor, SUMMARY_TEMPLATE])
+
+
+async def summarize_messages(base_url: str, model: str, system_prompt: str, messages: list[dict]) -> str | None:
+    """Send head history plus template prompt to the model; return the summary or None on failure."""
     body: dict = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ],
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
         "temperature": 0.2,
         "stream": True,
+        "max_tokens": SUMMARY_MAX_TOKENS,
     }
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
     try:
         parts: list[str] = []
         async with aiohttp.ClientSession() as session:
@@ -93,154 +260,54 @@ async def summarize_text(
                             parts.append(content)
         return "".join(parts).strip() or None
     except Exception:
-        logger.exception("summarize_text failed")
+        logger.exception("summarize_messages failed")
         return None
 
 
-def offload_tool_round_trip(
-    session_id: SessionID, name: str, call_id: str, arguments: str, result: Message | None
-) -> str:
-    """Offload a tool call round-trip (args + result) to one file; returns the path."""
-    call_id = (call_id or "unknown")[:8]
-    path = CONVERSATION_DIR / f"{session_id}_{name}_{call_id}.txt"
-    parts = []
-    if arguments:
-        parts.append(f"## arguments\n{arguments}")
-    if result is not None and result.get("content"):
-        parts.append(f"## result\n{result['content']}")
-    with open(path, "w") as fh:
-        fh.write("\n\n".join(parts))
-    return str(path)
-
-
-def replace_tool_call_with_pointer(tc: dict, name: str, arguments: str, path: str) -> None:
-    tc["function"]["arguments"] = json.dumps(
-        {"note": f"[{name} args ({len(arguments)} chars) saved to {path} - use read_file to retrieve]"}
-    )
-
-
-def replace_tool_result_with_pointer(result: Message, name: str, path: str) -> None:
-    result["content"] = (
-        f"[{name} output ({len(result.get('content') or '')} chars) saved to {path} - use read_file or conversation_search to retrieve]"
-    )
-
-
-def next_chunk_number(session_id: SessionID) -> int:
-    prefix = f"{session_id}_chunk_"
-    nums = []
-    if CONVERSATION_DIR.exists():
-        for f in CONVERSATION_DIR.iterdir():
-            n = f.name
-            if n.startswith(prefix) and n.endswith(".txt"):
-                try:
-                    nums.append(int(n[len(prefix) : -4]))
-                except ValueError:
-                    pass
-    return max(nums, default=0) + 1
-
-
-def offload_chunk(session_id: SessionID, msg: Message) -> None:
-    path = CONVERSATION_DIR / f"{session_id}_chunk_{next_chunk_number(session_id)}.txt"
-    with open(path, "w") as fh:
-        fh.write(msg["content"])
-    msg["content"] = f"[context chunk saved to {path} - use read_file or conversation_search to retrieve]"
+def find_previous_summary(messages: list[Message]) -> tuple[str | None, int | None]:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("compaction_summary"):
+            return messages[i].get("content"), i
+    return None, None
 
 
 async def compact_messages(
     base_url: str, messages: list[Message], session_id: SessionID, context_size: int, model: str
 ) -> None:
-    """Staged compaction: 1) summarize thinking, 2) offload tool outputs, 3) chunk non-user, 4) chunk user."""
-    target = compaction_target(context_size)
+    """Opencode-style compaction: prune old tool outputs, then replace the head with an anchored
+    structured summary (marker user message + assistant summary message) and keep the newest turns verbatim."""
+    if context_token_count(messages) <= compaction_target(context_size):
+        return
 
-    # Stage 1 - single whole-session thinking summary, swapped into the latest thinking message
-    thinking_msgs = [
-        m
-        for m in messages
-        if len(m.get("reasoning_content") or "") >= THINKING_NOISE_FLOOR_CHARS and not m.get("compacted_thinking")
+    prune(messages, context_size)
+
+    previous_summary, prev_idx = find_previous_summary(messages)
+    history = messages[prev_idx + 1 :] if prev_idx is not None else messages
+    head, tail = select(history, context_size)
+    if not head:
+        return
+
+    model_input = [to_summary_input(m) for m in head]
+    summary = await summarize_messages(
+        base_url, model, SUMMARY_SYSTEM_PROMPT, model_input + [{"role": "user", "content": build_prompt(previous_summary)}]
+    )
+    if not summary:
+        logger.warning("Compaction summarization failed, keeping current context")
+        return
+
+    new_messages: list[Message] = [
+        {"role": "user", "content": "[compaction] The conversation before this point was summarized.", "compaction_marker": True},
+        {"role": "assistant", "content": summary, "compaction_summary": True},
+        *tail,
     ]
-    if (
-        sum(len(m["reasoning_content"]) for m in thinking_msgs) // 4 >= THINKING_SESSION_MIN_TOKENS
-        and context_token_count(messages) > target
-    ):
-        section_texts = [f"--- section {i + 1} ---\n{m['reasoning_content']}" for i, m in enumerate(thinking_msgs)]
-        total_chars = sum(len(s) for s in section_texts)
-        while total_chars > THINKING_INPUT_MAX_CHARS and len(section_texts) > 1:
-            total_chars -= len(section_texts.pop(0))
-        sections = "\n\n".join(section_texts)
-        max_tokens = max(7000, total_chars // 4 // 10)
-        summary = await summarize_text(
-            base_url, sections, model, system_prompt=THINKING_SESSION_SYSTEM_PROMPT, max_tokens=max_tokens
-        )
-        if summary is None:
-            summary = await summarize_text(base_url, sections, model, system_prompt=THINKING_SESSION_SYSTEM_PROMPT)
-        if summary:
-            host = thinking_msgs[-1]
-            for m in thinking_msgs:
-                m["reasoning_content"] = ""
-            host["reasoning_content"] = summary
-            host["compacted_thinking"] = True
 
-    # Stage 2 - offload tool call round-trips (args + result) to files, largest pairs first
-    tool_results = {m.get("tool_call_id"): m for m in messages if m.get("role") == "tool"}
-    known_ids: set[str] = set()
-    pairs: list[tuple[int, dict, Message | None]] = []
-    for m in messages:
-        if m.get("role") != "assistant":
-            continue
-        for tc in m.get("tool_calls") or []:
-            call_id = tc.get("id", "")
-            known_ids.add(call_id)
-            args = tc.get("function", {}).get("arguments") or ""
-            result = tool_results.get(call_id)
-            size = len(args) + (len(result.get("content") or "") if result is not None else 0)
-            if size >= TOOL_OUTPUT_MIN_CHARS:
-                pairs.append((size, tc, result))
-    for m in messages:
-        if m.get("role") == "tool" and m.get("tool_call_id") not in known_ids and len(m.get("content") or "") >= TOOL_OUTPUT_MIN_CHARS:
-            pairs.append((len(m["content"]), {"id": m.get("tool_call_id"), "function": {"name": "tool"}}, m))
-    pairs.sort(key=lambda p: p[0], reverse=True)
-    for _size, tc, result in pairs:
-        if context_token_count(messages) <= target:
+    last_user: Message | None = None
+    for m in reversed(history):
+        if m.get("role") == "user" and not m.get("compaction_marker"):
+            last_user = m
             break
-        name = tc.get("function", {}).get("name", "tool")
-        args = tc.get("function", {}).get("arguments") or ""
-        path = offload_tool_round_trip(session_id, name, tc.get("id"), args, result)
-        if args:
-            replace_tool_call_with_pointer(tc, name, args, path)
-        if result is not None and result.get("content"):
-            replace_tool_result_with_pointer(result, name, path)
+    if last_user is not None and all(m is not last_user for m in tail):
+        new_messages.append(dict(last_user))
 
-    # Stage 3 - chunk offload non-user messages, oldest first
-    for m in messages:
-        if context_token_count(messages) <= target:
-            break
-        if m.get("role") in ("user", "system"):
-            continue
-        if len(m.get("content") or "") < CHUNK_MIN_CHARS:
-            continue
-        offload_chunk(session_id, m)
-
-    # Stage 4 - chunk offload user messages over the minimum, oldest first
-    for m in messages:
-        if context_token_count(messages) <= target:
-            break
-        if m.get("role") != "user":
-            continue
-        if len(m.get("content") or "") <= USER_CHUNK_MIN_CHARS:
-            continue
-        offload_chunk(session_id, m)
-
-    # Final fallback - archive everything if still over budget
-    # if context_token_count(messages) > target:
-    #     filename = archive_conversation(session_id, messages)
-    #     logger.warning(f"Compaction stages insufficient, archived to {filename}")
-    #     new_messages = [
-    #         {
-    #             "role": "assistant",
-    #             "content": f"The previous conversation was archived to {filename}",
-    #             "timestamp": datetime.now().isoformat(),
-    #         },
-    #         *messages[-4:],
-    #     ]
-    #     messages.clear()
-    #     messages.extend(new_messages)
+    messages.clear()
+    messages.extend(new_messages)

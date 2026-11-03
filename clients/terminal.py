@@ -1,4 +1,6 @@
+import json
 import logging
+import time
 import uuid
 
 from rich.markup import escape
@@ -7,7 +9,7 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Input, Markdown, Static
 
-from bus import Bus, Interrupt, Token, TurnDone, UsageReport, UserMessage
+from bus import Bus, History, Interrupt, Token, TurnDone, UsageReport, UserMessage
 
 logger = logging.getLogger()
 
@@ -46,6 +48,7 @@ class ChatApp(App):
         self.busy = False
         self.done = False
         self._frame_idx = 0
+        self._last_flush = 0.0
         self._pending: set[str] = set()
         self._stats_text = f"tokens: - / {self.context_size}"
 
@@ -131,34 +134,43 @@ class ChatApp(App):
                     inner = Static("")
                     await self.query_one("#chat_container").mount(Collapsible(inner, title="💭 Thinking"))
                     self.current_response = inner
-                    self.current_text = "[dim italic]"
                 else:
                     await self.create_container(markdown=True)
             else:
                 await self.create_container(markdown=False)
 
         if not chunk and token == "":
-            # Per-LLM-call end marker (fires between tool calls too) - reset streaming state only.
-            # The checkmark is set by the turn event, which fires once per user turn.
+            # Per-LLM-call end marker (fires between tool calls too) - flush any pending
+            # buffered text, then reset streaming state only. The checkmark is set by the
+            # turn event, which fires once per user turn.
+            if getattr(self, "_thinking_active", False):
+                self._flush_thinking()
             self.state = ChatApp.STATE_IDLE
             return
 
         if role != "thinking" and chunk and getattr(self, "_thinking_active", False):
-            self.current_response.update(self.current_text + "[/]")
+            self.current_response.update("[dim italic]" + escape(self.current_text) + "[/]")
             await self.create_container(markdown=True)
             self.current_text = ""
             self._thinking_active = False
 
         if role == "thinking" and chunk:
             self._thinking_active = True
+            self._last_flush = 0.0  # first token renders immediately
 
         if self.state == ChatApp.STATE_STREAMING:
-            self.current_text += escape(token)
-            new_content = self.current_text
+            self.current_text += token  # raw; markup is applied at flush time
+            if self._thinking_active:
+                # Static + rich markup: escape the full accumulated text (style tags can
+                # span token boundaries, so per-token escaping leaks them), throttled to
+                # ~30 updates/sec since each update re-parses and re-lays-out everything.
+                if time.monotonic() - self._last_flush >= 0.033:
+                    self._flush_thinking()
+            else:
+                self.current_response.update(self.current_text)  # Markdown widget: raw text, no markup parsing
         else:
-            new_content = f"[bold magenta]{role} 🤖:[/][white] {escape(token)}[/]"
+            self.current_response.update(f"[bold magenta]{role} 🤖:[/][white] {escape(token)}[/]")
 
-        self.current_response.update(new_content)
         container = self.query_one("#chat_container")
         # Follow the stream only if the user is at the bottom (half-line
         # epsilon absorbs float noise from Textual's own pinning);
@@ -166,6 +178,67 @@ class ChatApp(App):
         # interaction that released it (wheel, scrollbar, widget focus).
         if container.scroll_y + 0.5 >= container.max_scroll_y:
             container.scroll_end(animate=False)
+
+
+    def _flush_thinking(self) -> None:
+        """Render the accumulated raw thinking text; escape covers the whole string."""
+        self.current_response.update("[dim italic]" + escape(self.current_text))
+        self._last_flush = time.monotonic()
+
+    async def render_history(self, messages: list[dict]) -> None:
+        """Mount saved conversation history using the same widgets as live rendering.
+
+        Mounts are queued without awaiting so they all land before the next frame
+        is drawn - the window appears fully populated in a single draw."""
+        container = self.query_one("#chat_container")
+        mounts = []
+        i = 0
+        while i < len(messages):
+            m = messages[i]
+            role = m.get("role")
+
+            if m.get("compaction_marker"):
+                # Render marker + summary pair as one system-event entry
+                summary = None
+                if i + 1 < len(messages) and messages[i + 1].get("compaction_summary"):
+                    summary = messages[i + 1].get("content")
+                    i += 1
+                mounts.append(container.mount(Static("[bold magenta]compaction \U0001F916:[/][white] context compacted[/]")))
+                if summary:
+                    # Content passed at construction (post-mount update would be lost before mount)
+                    mounts.append(container.mount(Collapsible(Markdown(summary), title="\U0001F4DD Summary")))
+                i += 1
+                continue
+
+            if role == "user":
+                text = m.get("content") or ""
+                if text.strip():
+                    mounts.append(container.mount(Static(f"[bold cyan]You:[/][white] {escape(text)}[/]")))
+            elif role == "assistant":
+                reasoning = m.get("reasoning_content")
+                if reasoning:
+                    mounts.append(container.mount(Collapsible(Static(f"[dim italic]{escape(reasoning)}[/]"), title="\U0001F4AD Thinking")))
+                content = m.get("content")
+                if content:
+                    mounts.append(container.mount(Markdown(content)))
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "")
+                    try:
+                        parsed = json.loads(args) if args else {}
+                        args_short = ", ".join(f"{k}={v!r}" for k, v in parsed.items())
+                    except (ValueError, AttributeError):
+                        args_short = str(args)
+                    if len(args_short) > 200:
+                        args_short = args_short[:200] + "..."
+                    # Same line format as live tool status events
+                    mounts.append(container.mount(Static(f"[bold magenta]tool \U0001F916:[/][white] {escape(name + '(' + args_short + ')')}[/]")))
+            # tool results are not rendered (parity with live mode)
+            i += 1
+        for mount in mounts:
+            await mount
+        container.scroll_end(animate=False)
 
 
 async def write_output(app: ChatApp, bus: Bus):
@@ -180,6 +253,8 @@ async def write_output(app: ChatApp, bus: Bus):
                     await app.update_stats(usage)
                 case TurnDone(msg_id):
                     await app.turn_done(msg_id)
+                case History(messages):
+                    await app.render_history(messages)
         except Exception:
             logger.exception("Failed to render outbound event: %s", event)
 

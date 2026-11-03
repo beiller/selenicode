@@ -48,7 +48,14 @@ class UsageReport:
     usage: dict
 
 
-Event = UserMessage | Interrupt | Shutdown | Token | TurnDone | UsageReport
+@dataclass(frozen=True)
+class History:
+    """Outbound: full message history for a resumed session (terminal only)."""
+
+    messages: list[dict]
+
+
+Event = UserMessage | Interrupt | Shutdown | Token | TurnDone | UsageReport | History
 
 
 class Bus:

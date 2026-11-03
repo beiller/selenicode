@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -125,6 +127,115 @@ class TestInterrupt(unittest.TestCase):
         self.assertTrue(partial["content"].startswith("c0"))
         self.assertNotIn("tool_calls", partial)
         self.assertFalse(b.interrupted)
+
+
+class TestAsyncMainHistory(unittest.TestCase):
+    def _run_async_main(self, client_type, session_id):
+        async def fake_run(bus, context_size=0):
+            return None
+
+        async def fake_init():
+            return None
+
+        async def fake_main(resume=False, session_id=None):
+            return None
+
+        fake_client = types.SimpleNamespace(run=fake_run)
+        with mock.patch.object(main, "_load_client", lambda ct: fake_client), mock.patch.object(
+            main, "main_init", fake_init
+        ), mock.patch.object(main, "main", fake_main), mock.patch.object(
+            main, "read_conversation", lambda sid: [{"role": "user", "content": "hi"}]
+        ):
+            asyncio.run(main.async_main(client_type, session_id))
+
+        events = []
+        while not main.bus.outbound.empty():
+            events.append(main.bus.outbound.get_nowait())
+        return events
+
+    def test_history_posted_for_terminal_resume(self):
+        events = self._run_async_main("terminal", "sess1234")
+        histories = [e for e in events if isinstance(e, bus_mod.History)]
+        self.assertEqual(len(histories), 1)
+        self.assertEqual(histories[0].messages, [{"role": "user", "content": "hi"}])
+
+    def test_no_history_for_discord_even_on_resume(self):
+        events = self._run_async_main("discord_client", "sess1234")
+        self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
+
+    def test_no_history_for_fresh_terminal_session(self):
+        events = self._run_async_main("terminal", None)
+        self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
+
+
+class TestSessionWipeGuard(unittest.TestCase):
+    """A wrong user_id yields an empty in-memory list; compact/reset must not
+    then overwrite a non-empty session file (data-loss regression)."""
+
+    DISK_MSGS = [{"role": "user", "content": "saved"}, {"role": "assistant", "content": "hi"}]
+
+    def _call_compact(self, user_id):
+        written = []
+
+        async def fake_compact(base_url, messages, session_id, context_size, model):
+            return None
+
+        with mock.patch.object(main, "read_conversation", lambda sid: list(self.DISK_MSGS)), \
+             mock.patch.object(main, "compact_messages", fake_compact), \
+             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
+            return json.loads(asyncio.run(main.compact_session(user_id, "sess1"))), written
+
+    def _call_reset(self, user_id):
+        written = []
+        with mock.patch.object(main, "read_conversation", lambda sid: list(self.DISK_MSGS)), \
+             mock.patch.object(main, "archive_conversation", lambda sid, msgs: "/tmp/archive.txt"), \
+             mock.patch.object(main, "set_user_messages", lambda uid, msgs: None), \
+             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
+            return json.loads(main.reset_session(user_id, "sess1")), written
+
+    def test_compact_refuses_to_wipe_nonempty_session(self):
+        status, written = self._call_compact("wrong_user")
+        self.assertTrue(status["status"].startswith("error"))
+        self.assertEqual(written, [])
+
+    def test_reset_refuses_to_wipe_nonempty_session(self):
+        status, written = self._call_reset("wrong_user")
+        self.assertTrue(status["status"].startswith("error"))
+        self.assertEqual(written, [])
+
+    def test_compact_proceeds_when_memory_has_messages(self):
+        main.user_registry["good_user"] = list(self.DISK_MSGS)
+        try:
+            status, written = self._call_compact("good_user")
+        finally:
+            main.user_registry.pop("good_user", None)
+        self.assertFalse(status["status"].startswith("error"))
+        self.assertEqual(len(written), 1)
+
+    def test_reset_proceeds_when_memory_has_messages(self):
+        main.user_registry["good_user"] = list(self.DISK_MSGS)
+        try:
+            status, written = self._call_reset("good_user")
+        finally:
+            main.user_registry.pop("good_user", None)
+        self.assertFalse(status["status"].startswith("error"))
+        self.assertEqual(len(written), 1)
+
+    def test_guard_allows_empty_write_when_disk_missing(self):
+        written = []
+
+        async def fake_compact(base_url, messages, session_id, context_size, model):
+            return None
+
+        def missing(sid):
+            raise FileNotFoundError(sid)
+
+        with mock.patch.object(main, "read_conversation", missing), \
+             mock.patch.object(main, "compact_messages", fake_compact), \
+             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
+            status = json.loads(asyncio.run(main.compact_session("any_user", "sess1")))
+        self.assertFalse(status["status"].startswith("error"))
+        self.assertEqual(len(written), 1)
 
 
 if __name__ == "__main__":
