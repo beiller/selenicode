@@ -9,13 +9,13 @@ This software is alpha quality and may delete files on your system.
 
 ## Overview
 
-Selenicode is a plugin-based AI assistant server that communicates with multiple client types (Terminal, Discord, IRC) through a unified message queue system. The server processes user queries through an LLM and executes tool calls via skills.
+Selenicode is a plugin-based AI assistant server that communicates with multiple client types (Terminal, Discord, IRC) through a typed event bus. The server processes user queries through an LLM and executes tool calls via skills.
 
 **Key Features:**
 - Multi-platform support (Terminal, Discord, IRC)
 - Plugin-based skill system for extensibility
 - Conversation memory with vector search capabilities
-- Async message queue architecture
+- Typed event-bus architecture
 - **One-click setup** - Everything automates for you! 🚀
 
 ## Quick Start (One-Click Install)
@@ -89,7 +89,7 @@ See Functions.md
 
 ## High-Level Components
 
-### Core Server (`server.py`)
+### Core Server (`main.py`)
 
 The central hub that orchestrates communication between clients and the LLM.
 
@@ -97,28 +97,31 @@ The central hub that orchestrates communication between clients and the LLM.
 - Manages HTTP transport to llama-server
 - Handles conversation state (message history)
 - Processes tool calls and executes skills
-- Routes queries and responses through queues
-- Loads and registers skill tools dynamically
-
-**Key Data Structures:**
-- `queries`: AsyncQueue - Incoming user messages from clients
-- `responses`: AsyncQueue - Outgoing chat tokens/results to clients
-- `messages`: List[Message] - Conversation history (persists across calls)
+- Routes all client traffic through a typed event bus
+- Loads and registers skill tools dynamically (cached; rebuilt only when skill files change)
 
 **Main Flow:**
 ```
-Client → queue_query() → queries queue → server.py → handle_message() 
+Client → bus.post(UserMessage) → main loop → handle_message()
 → stream_chat_completion() → consume_stream() → execute_tool_calls()
-→ responses queue → client
+→ Token / UsageReport / TurnDone events on the bus → client
 ```
+
+### Event Bus (`bus.py`)
+
+A single typed event bus for all client ↔ core communication:
+
+- **Inbound:** `UserMessage`, `Interrupt`, `Shutdown`
+- **Outbound:** `Token` (streamed chunks), `UsageReport`, `TurnDone`
+
+`Bus.post()` is thread-safe, so clients can post from any thread (e.g. the IRC reactor thread). Clients fulfil a small `Client` protocol — no global injection.
 
 ### Client Plugins
 
 Three client implementations that follow the same interface pattern:
 
 #### Terminal (`terminal.py`)
-- Single-user interface (local terminal)
-- Direct stdin/stdout interaction
+- Single-user interface (local terminal, Textual UI)
 - No user tracking needed (only one user)
 
 #### Discord (`discord_client.py`)
@@ -131,16 +134,11 @@ Three client implementations that follow the same interface pattern:
 
 ##### Client API
 
-Each client has the following API provided to it:
-
 ```python
-async def queue_query(query: str) -> None:
-    global queries
-    await queries.put(query)
+class Client(Protocol):
+    async def run(self, bus: Bus, context_size: int = 0) -> None: ...
 
-
-async def get_response() -> Tuple[str, str, bool]:
-    return await responses.get()
+    def stop(self) -> None: ...
 ```
 
 ### Skill System

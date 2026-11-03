@@ -1,11 +1,10 @@
 import json
 import logging
 import os
-from datetime import datetime
 
 import aiohttp
 
-from conversation import CONVERSATION_DIR, approximate_token_count, archive_conversation
+from conversation import CONVERSATION_DIR, approximate_token_count
 from main_types import Message, SessionID
 
 logger = logging.getLogger()
@@ -41,13 +40,13 @@ def _pct(env_var: str, default: float) -> float:
 
 
 def compaction_trigger(context_size: int) -> int:
-    """Auto-trigger threshold: compaction starts when context exceeds this (default: 70%)."""
-    return int(context_size * _pct("COMPACTION_TRIGGER_PCT", 70.0) / 100)
+    """Auto-trigger threshold: compaction starts when context exceeds this (default: 80%)."""
+    return int(context_size * _pct("COMPACTION_TRIGGER_PCT", 80.0) / 100)
 
 
 def compaction_target(context_size: int) -> int:
-    """Shrink-to target: stages stop once context is at or below this (default: 70%)."""
-    return int(context_size * _pct("COMPACTION_TARGET_PCT", 70.0) / 100)
+    """Shrink-to target: stages stop once context is at or below this (default: 20%)."""
+    return int(context_size * _pct("COMPACTION_TARGET_PCT", 20.0) / 100)
 
 
 def context_token_count(messages: list[Message]) -> int:
@@ -168,7 +167,7 @@ async def compact_messages(
         while total_chars > THINKING_INPUT_MAX_CHARS and len(section_texts) > 1:
             total_chars -= len(section_texts.pop(0))
         sections = "\n\n".join(section_texts)
-        max_tokens = max(2000, total_chars // 4 // 10)
+        max_tokens = max(7000, total_chars // 4 // 10)
         summary = await summarize_text(
             base_url, sections, model, system_prompt=THINKING_SESSION_SYSTEM_PROMPT, max_tokens=max_tokens
         )

@@ -309,7 +309,7 @@ def read_file(file_path: str, offset: int | None = None, limit: int | None = Non
     return json.dumps({"status": "success", "result": "\n".join(output)})
 
 
-def write_file(file_path: str, file_contents: str) -> str:
+def write_file(file_path: str, file_content: str) -> str:
     """Writes a file to the local filesystem.
 
     Usage:
@@ -335,8 +335,8 @@ def write_file(file_path: str, file_contents: str) -> str:
             if not source_bom:
                 content_old = raw_bytes.decode("utf-8", errors="replace")
 
-        desired_bom = source_bom or file_contents.startswith("\ufeff")
-        content_new = file_contents[1:] if (desired_bom and file_contents.startswith("\ufeff")) else file_contents
+        desired_bom = source_bom or file_content.startswith("\ufeff")
+        content_new = file_content[1:] if (desired_bom and file_content.startswith("\ufeff")) else file_content
 
         parent = os.path.dirname(filepath)
         if parent:

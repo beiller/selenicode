@@ -1,51 +1,31 @@
 import asyncio
 import logging
 import os
-import time
-from typing import Callable, Optional, Tuple
+import uuid
+from typing import Optional
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+from bus import Bus, Interrupt, UserMessage
+
+from .common import async_rate_limit, consume_tokens
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
 client = None
-outbox: list[tuple[str, str, str]] = []  # (user_id, action, text) where action is "status" | "message"
-inbox = []
-
-queue_query: Callable[[str, str], None] = None
-get_response: Callable[None, Tuple[str, str, str, bool]] = None
-set_interrupt: Callable[[str], None] = None
+_bus: Bus | None = None
+user_id_mapping = {}
+status_msg_ids: dict[str, str] = {}
 
 STATUS_ROLES = {"tool", "error", "info"}
 MAX_STATUS_LEN = 1900
 
 
-def rate_limit(calls, period=10):
-    def decorator(func):
-        timestamps = []
-
-        async def wrapper(*args, **kwargs):
-            now = time.monotonic()
-            timestamps[:] = [t for t in timestamps if now - t < period]
-            if len(timestamps) >= calls:
-                await asyncio.sleep(period - (now - timestamps[0]))
-            timestamps.append(time.monotonic())
-            return await func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-user_id_mapping = {}
-status_msg_ids: dict[str, str] = {}
-
-
-@rate_limit(10, 10)
+@async_rate_limit(10, 10)
 async def send_new_message(user_id: str, message: str) -> Optional[str]:
     if message == "":
         logger.warning("(discord) discarded empty message")
@@ -61,7 +41,7 @@ async def send_new_message(user_id: str, message: str) -> Optional[str]:
         return None
 
 
-@rate_limit(10, 10)
+@async_rate_limit(10, 10)
 async def edit_message(user_id: str, message_id: str, text: str) -> Optional[str]:
     global client
     channel_id = user_id_mapping[user_id].split(":")[0]
@@ -100,22 +80,17 @@ def split_message(message: str, chunk_size: int = 1500) -> list[str]:
     return chunks
 
 
-async def message_poll():
-    global outbox
-
-    while True:
-        if outbox:
-            for user_id, action, text in outbox:
-                if client and not client.is_closed() and len(text) > 0:
-                    if action == "status":
-                        await post_status(user_id, text)
-                    else:
-                        # New message (assistant reply); reset the rolling status
-                        for chunk in split_message(text, 1500):
-                            await send_new_message(user_id, chunk)
-                        status_msg_ids.pop(user_id, None)
-            outbox = []
-        await asyncio.sleep(0.1)
+async def handle_complete(user_id: str, role: str, text: str) -> None:
+    """One complete (non-chunk) message from the bus."""
+    if not text:
+        return
+    if role in STATUS_ROLES:
+        line = text[:200] + ("..." if len(text) > 200 else "")
+        await post_status(user_id, line)
+    elif role == "assistant":
+        for chunk in split_message(text, 1500):
+            await send_new_message(user_id, chunk)
+        status_msg_ids.pop(user_id, None)
 
 
 def get_unique_query_id(message):
@@ -123,38 +98,6 @@ def get_unique_query_id(message):
     channel_id = message.channel.id
     query_id = str(channel_id) + ":" + str(message_id)
     return query_id
-
-
-async def digest_user_query():
-    global inbox, user_id_mapping
-    while True:
-        while inbox:
-            message = inbox.pop()
-            query_id = get_unique_query_id(message)
-            user_id_mapping[str(message.author.id)] = query_id
-            await queue_query(str(message.author.id), message.content)
-        await asyncio.sleep(0.01)
-
-
-async def digest_agent_response():
-    global outbox
-    message = ""
-    while True:
-        user_id, role, token, chunk = await get_response()
-        if role == "thinking":
-            continue
-        if chunk:
-            message += token
-        else:
-            text = message + token
-            message = ""
-            if not text:
-                continue
-            if role in STATUS_ROLES:
-                line = text[:200] + ("..." if len(text) > 200 else "")
-                outbox.append((user_id, "status", line))
-            elif role == "assistant":
-                outbox.append((user_id, "message", text))
 
 
 class DiscordClient(commands.Bot):
@@ -171,56 +114,35 @@ class DiscordClient(commands.Bot):
             return
 
         logger.info(f"DM from {message.author}: {message.content}")
+        user_id = str(message.author.id)
+        user_id_mapping[user_id] = get_unique_query_id(message)
         if message.content.lower().strip() == "stop":
-            await set_interrupt(str(message.author.id))
+            _bus.post(Interrupt(user_id))
         else:
-            inbox.append(message)
-        # Optionally reply to confirm receipt
-        # await message.reply("Message received!")
-
-    async def on_raw_message_edit(self, payload):
-        """Handle message edits if needed"""
-        pass
+            _bus.post(UserMessage(user_id, message.content, uuid.uuid4().hex[:8]))
 
 
-async def run_discord_client():
-    global client
+async def run(bus: Bus, context_size: int = 0) -> None:
+    """Run the Discord bot and the outbound consumer until cancelled."""
+    global client, _bus
+    _bus = bus
 
     # Disable privileged intents to avoid the PrivilegedIntentsRequired error
     intents = discord.Intents.default()
-    # Explicitly disable privileged intents
     intents.message_content = False  # Not needed for DMs
     intents.members = False  # Not used in this code
 
     client = DiscordClient(command_prefix="!", intents=intents)
-
-    # Run in background
-    await client.start(os.getenv("DISCORD_TOKEN"), reconnect=True)
-
-
-def on_ready():
-    pass
+    await asyncio.gather(
+        client.start(os.getenv("DISCORD_TOKEN"), reconnect=True),
+        consume_tokens(bus, handle_complete),
+    )
 
 
-def stop():
+def stop() -> None:
     global client
     if client and not client.is_closed():
         if asyncio.get_event_loop().is_running():
             asyncio.run_coroutine_threadsafe(client.close(), asyncio.get_event_loop())
         else:
             asyncio.run(client.close())
-
-
-async def init(
-    _queue_query: Callable[[str, str], None],
-    _get_response: Callable[None, Tuple[str, str, str, bool]],
-    _set_interrupt: Callable[[str], None],
-):
-    global queue_query, get_response, set_interrupt
-
-    queue_query = _queue_query
-    get_response = _get_response
-    set_interrupt = _set_interrupt
-
-    # Run the Discord bot and I/O digesters concurrently on the event loop
-    await asyncio.gather(run_discord_client(), digest_agent_response(), digest_user_query(), message_poll())

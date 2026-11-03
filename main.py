@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import inspect
 import json
 import os
@@ -12,7 +14,6 @@ import subprocess
 import sys
 import types
 import urllib.request
-import uuid
 from datetime import datetime
 from typing import AsyncIterator, Callable, Union, get_type_hints
 
@@ -124,7 +125,12 @@ def get_context_size() -> int:
 # Types – Chat Completions API
 # ---------------------------------------------------------------------------
 
-from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
+from bus import Bus, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+
+if os.getenv("COMPACTION_METHOD", "v2") == "v1":
+    from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
+else:
+    from compaction_v2 import compact_messages, compaction_target, compaction_trigger, context_token_count
 from conversation import (
     approximate_token_count,
     archive_conversation,
@@ -250,9 +256,15 @@ async def stream_chat_completion(
 
 
 async def consume_stream(
-    chunks: AsyncIterator[ChatCompletionChunk], user_id: UserID, emit_fn: Callable[[str, str, str, bool], None] = None
+    chunks: AsyncIterator[ChatCompletionChunk],
+    user_id: UserID,
+    emit_fn: Callable[[UserID, str, str, bool], None] | None = None,
+    interrupted_check: Callable[[], bool] | None = None,
 ) -> tuple[Message, Usage | None]:
-    """Consume streamed chunks, emit tokens, and return the assembled Message and usage."""
+    """Consume streamed chunks, emit tokens, and return the assembled Message and usage.
+
+    If interrupted_check() becomes true mid-stream, stop consuming and return the
+    partial message assembled so far (its tool_calls must not be executed)."""
     role = "assistant"
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -260,6 +272,8 @@ async def consume_stream(
     usage: Usage | None = None
 
     async for chunk in chunks:
+        if interrupted_check is not None and interrupted_check():
+            break
         if chunk.get("usage"):
             usage = chunk["usage"]
         if not chunk.get("choices"):
@@ -325,7 +339,7 @@ async def consume_stream(
 
 
 def emit(user_id: UserID, role: str, content: str, chunk: bool = False) -> None:
-    responses.put_nowait((user_id, role, content, chunk))
+    bus.outbound.put_nowait(Token(user_id, role, content, chunk))
 
 
 async def execute_tool_calls(
@@ -408,137 +422,154 @@ def build_tools() -> tuple[list[Tool], dict[str, ToolHandler]]:
     return tools, registry
 
 
-async def run_tool_loop(base_url: str, user_id: UserID, messages: List[Message], session_id: SessionID) -> str:
+_tool_cache: tuple[list[Tool], dict[str, ToolHandler]] | None = None
+_skill_mtimes: tuple[float, ...] = ()
+
+
+def _skills_signature() -> tuple[float, ...]:
+    sig: list[float] = []
+    for d in (SKILLS_DIR, LOCAL_SKILLS_DIR):
+        if d.is_dir():
+            sig.extend(f.stat().st_mtime for f in sorted(d.glob("*.md")))
+    return tuple(sig)
+
+
+def get_tools() -> tuple[list[Tool], dict[str, ToolHandler]]:
+    """Cached build_tools(); rebuilds only when skill files change on disk."""
+    global _tool_cache, _skill_mtimes
+    sig = _skills_signature()
+    if _tool_cache is None or sig != _skill_mtimes:
+        _tool_cache = build_tools()
+        _skill_mtimes = sig
+    return _tool_cache
+
+
+def _finalize_assistant(msg: Message, messages: list[Message]) -> str:
+    """Strip tool_calls, stamp and append the final assistant message; return its text."""
+    final = {k: v for k, v in msg.items() if k != "tool_calls"}
+    final["content"] = msg.get("content") or ""
+    final["timestamp"] = datetime.now().isoformat()
+    messages.append(final)
+    return final["content"]
+
+
+async def _wait_interrupt(user_id: UserID) -> None:
+    """Resolve once the user's interrupt flag is set (polled; chunks may be stalled)."""
+    while user_id not in bus.interrupted:
+        await asyncio.sleep(0.1)
+
+
+async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message], session_id: SessionID) -> str:
     """Stream messages, handle tool calls in a loop, return final text."""
-    global interrupts
     max_calls = 200
     tool_counter = 0
 
     while True:
-        if user_id in interrupts and interrupts[user_id]:
-            del interrupts[user_id]
+        if user_id in bus.interrupted:
+            bus.interrupted.discard(user_id)
             emit(user_id, "info", "Interrupted. What can I help you with?")
-            break
+            return ""
 
-        tools, registry = build_tools()
+        size = context_token_count(messages)
+        if size > compaction_trigger(CONTEXT_SIZE):
+            logger.info(f"Context {size} tokens exceeded trigger mid-loop, compacting")
+            await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
+            size = context_token_count(messages)
+            if size > CONTEXT_SIZE:
+                logger.warning(f"Compaction insufficient mid-loop: {size} tokens > {CONTEXT_SIZE}, stopping turn")
+                emit(user_id, "info", f"Context still at {size} tokens after compaction, stopping turn")
+                return ""
+
+        tools, registry = get_tools()
         chunks = stream_chat_completion(base_url, messages, tools, session_id, user_id)
+        # Consume in a task so an interrupt can cancel a stalled stream (no chunks
+        # flowing); when chunks are flowing, the per-chunk check breaks gracefully
+        # and the partial message is kept.
+        consume_task = asyncio.create_task(consume_stream(chunks, user_id, emit, lambda: user_id in bus.interrupted))
+        interrupt_waiter = asyncio.create_task(_wait_interrupt(user_id))
+        done, pending = await asyncio.wait({consume_task, interrupt_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
-        assistant_msg, usage = await consume_stream(chunks, user_id, emit)
+        if user_id in bus.interrupted:
+            # Interrupted mid-stream: end the turn without executing tools.
+            bus.interrupted.discard(user_id)
+            emit(user_id, "assistant", "", False)
+            if consume_task in done and not consume_task.cancelled():
+                assistant_msg, _ = consume_task.result()
+                _finalize_assistant(assistant_msg, messages)  # partial kept, tool_calls stripped
+            await chunks.aclose()  # close the HTTP stream (no-op if already finished)
+            emit(user_id, "info", "Interrupted. What can I help you with?")
+            return ""
+
+        assistant_msg, usage = consume_task.result()
         if usage is not None:
-            usage_events.put_nowait((user_id, usage))
+            bus.outbound.put_nowait(UsageReport(user_id, usage))
         emit(user_id, "assistant", "", False)  # send a final empty message so the client knows the end of message.
         tool_msgs = await execute_tool_calls(assistant_msg, registry, user_id)
 
         if not tool_msgs:
-            text = assistant_msg.get("content") or ""
-            # Add timestamp when LLM responds
-            assistant_msg_with_ts = {k: v for k, v in assistant_msg.items() if k != "tool_calls"}
-            assistant_msg_with_ts["content"] = text
-            assistant_msg_with_ts["timestamp"] = datetime.now().isoformat()
-            messages.append(assistant_msg_with_ts)
-            return text
+            return _finalize_assistant(assistant_msg, messages)
 
-        # Add timestamps to tool result messages
-        tool_msgs_with_ts = []
         for tm in tool_msgs:
-            tm_copy = tm.copy()
-            tm_copy["timestamp"] = datetime.now().isoformat()
-            tool_msgs_with_ts.append(tm_copy)
-        messages.extend(tool_msgs_with_ts)
+            stamped = tm.copy()
+            stamped["timestamp"] = datetime.now().isoformat()
+            messages.append(stamped)
 
         tool_counter += 1
         if tool_counter > max_calls:
             emit(user_id, "info", "too many tool calls, giving up")
-            text = assistant_msg.get("content") or ""
-            # Add timestamp when LLM responds
-            assistant_msg_with_ts = {k: v for k, v in assistant_msg.items() if k != "tool_calls"}
-            assistant_msg_with_ts["content"] = text
-            assistant_msg_with_ts["timestamp"] = datetime.now().isoformat()
-            messages.append(assistant_msg_with_ts)
-            return text
+            return _finalize_assistant(assistant_msg, messages)
 
 
 async def handle_message(user_input: str, base_url: str, user_id: UserID, session_id: SessionID, msg_id: str) -> None:
     """Handle a user message event: append it, run the tool loop, emit the reply."""
     try:
-        await _handle_message_inner(user_input, base_url, user_id, session_id)
+        messages = get_user_messages(user_id)
+        # Add timestamp when user types the message
+        user_msg = make_user_message(user_input)
+        user_msg["timestamp"] = datetime.now().isoformat()
+        messages.append(user_msg)
+        write_conversation(session_id, messages)
+
+        await run_tool_loop(base_url, user_id, messages, session_id)  # modifies messages
+
+        if context_token_count(messages) > compaction_trigger(CONTEXT_SIZE):
+            logger.info("Compacting conversation")
+            await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
+            size = approximate_token_count(json.dumps(messages))
+            logger.info(f"Context size is {size} of {CONTEXT_SIZE}")
+
+        write_conversation(session_id, messages)
     finally:
-        turn_events.put_nowait(msg_id)
-
-
-async def _handle_message_inner(user_input: str, base_url: str, user_id: UserID, session_id: SessionID) -> None:
-    messages = get_user_messages(user_id)
-    # Add timestamp when user types the message
-    user_msg = make_user_message(user_input)
-    user_msg["timestamp"] = datetime.now().isoformat()
-    messages.append(user_msg)
-    write_conversation(session_id, messages)
-
-    await run_tool_loop(  # modifies messages
-        base_url, user_id, messages, session_id
-    )
-
-    if context_token_count(messages) > compaction_trigger(CONTEXT_SIZE):
-        logger.info("Compacting conversation")
-        await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
-        size = approximate_token_count(json.dumps(messages))
-        logger.info(f"Context size is {size} of {CONTEXT_SIZE}")
-
-    write_conversation(session_id, messages)
+        bus.outbound.put_nowait(TurnDone(msg_id))
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-import asyncio
-from typing import Dict, List, Tuple
-
-queries = asyncio.Queue()
-responses = asyncio.Queue()
-usage_events = asyncio.Queue()
-turn_events = asyncio.Queue()
-interrupts = {}
+bus = Bus()
 
 
-async def queue_query(user_id: UserID, query: str) -> str:
-    """Queue a user message and return its id (for turn-event tracking)."""
-    global queries
-    msg_id = uuid.uuid4().hex[:8]
-    await queries.put((user_id, query, msg_id))
-    return msg_id
+# USER DATABASE
+user_registry: dict[UserID, list[Message]] = {}
 
 
-async def get_reponse() -> Tuple[UserID, str, str, bool]:
-    return await responses.get()
+def get_user_messages(user_id: UserID) -> list[Message]:
+    if user_id not in user_registry:
+        user_registry[user_id] = []
+    return user_registry[user_id]
 
 
-async def set_interrupt(user_id: UserID) -> None:
-    global interrupts
-    interrupts[user_id] = True
-
-
-#  USER DATABASE
-def init_registry() -> Tuple[Callable[[UserID], list[Message]], Callable[[UserID, list[Message]], None]]:
-    user_registry: Dict[UserID, list[Message]] = {}
-
-    def get_user_messages(user_id: UserID):
-        if user_id not in user_registry:
-            user_registry[user_id] = []
-        return user_registry.get(user_id)
-
-    def set_user_messages(user_id: UserID, messages: List[Message]):
-        user_registry[user_id] = messages
-
-    return get_user_messages, set_user_messages
-
-
-get_user_messages, set_user_messages = init_registry()
+def set_user_messages(user_id: UserID, messages: list[Message]) -> None:
+    user_registry[user_id] = messages
 
 
 def reset_session(user_id: UserID = "", session_id: SessionID = ""):
     "Reset the session and chat history. Provide the Current user_id AND the session id"
     logger.info(f"Clear session for user_id {user_id}")
-    messages: List[Message] = get_user_messages(user_id)
+    messages: list[Message] = get_user_messages(user_id)
     filepath: str = archive_conversation(session_id, messages)
     messages.clear()
     set_user_messages(user_id, messages)
@@ -547,9 +578,9 @@ def reset_session(user_id: UserID = "", session_id: SessionID = ""):
 
 
 async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
-    "Compact the current conversation to free context space: summarize thinking sections, offload large tool outputs and message chunks to files"
+    "Compact the current conversation to free context space: prune old tool outputs, replace older history with a structured summary, keep recent turns verbatim"
     base_url = os.getenv("LLAMA_BASE_URL")
-    messages: List[Message] = get_user_messages(user_id)
+    messages: list[Message] = get_user_messages(user_id)
     logger.info(f"Compacting session {session_id} on request")
     await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
     write_conversation(session_id, messages)
@@ -557,10 +588,9 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     return json.dumps({"status": f"Compaction complete. Context size is {size} of {CONTEXT_SIZE}"})
 
 
-async def main_init() -> SessionID:
-    global interrupts
+async def main_init() -> None:
     global CONTEXT_SIZE
-    """Run the conversation loop, using the provided I/O callbacks."""
+    """Start llama-server if needed, load the model, and read the context size."""
     # Load from environment variables if not provided
     base_url = os.getenv("LLAMA_BASE_URL")
 
@@ -600,50 +630,43 @@ async def main_init() -> SessionID:
     await asyncio.sleep(3)
 
 
-async def main(
-    on_ready: Callable = None,
-    resume: bool = False,
-    session_id=None,
-) -> None:
+async def main(resume: bool = False, session_id: str | None = None) -> None:
     base_url = os.getenv("LLAMA_BASE_URL")
     session_resumed = False
     try:
         while True:
-            try:
-                await asyncio.sleep(0.1)
-                on_ready()
-                user_id, user_input, msg_id = await queries.get()
-                if user_id in interrupts:
-                    del interrupts[user_id]
-            except asyncio.CancelledError:
-                logger.warning("Main loop cancelled")
-                break
-            except KeyboardInterrupt:
-                break
+            event = await bus.inbound.get()
+            match event:
+                case Shutdown():
+                    break
+                case Interrupt(user_id):
+                    bus.interrupted.add(user_id)  # already set by Bus.post; keeps queue-drain consistent
+                    continue
+                case UserMessage(user_id, text, msg_id):
+                    bus.interrupted.discard(user_id)  # a stale interrupt must not cancel the new turn
 
-            # load the conversation up once hacky TODO
-            if resume and not session_resumed:
-                set_user_messages(user_id, read_conversation(session_id))
-                session_resumed = True
+                    # load the conversation up once hacky TODO
+                    if resume and not session_resumed:
+                        set_user_messages(user_id, read_conversation(session_id))
+                        session_resumed = True
 
-            if user_input is None:
-                break
-            if not user_input.strip():
-                turn_events.put_nowait(msg_id)
-                continue
-            if user_input.strip().lower() == "/compact":
-                logger.info(f"/compact command from {user_id}")
-                result = await compact_session(user_id, session_id)
-                emit(user_id, "info", json.loads(result)["status"])
-                turn_events.put_nowait(msg_id)
-                continue
-            try:
-                await handle_message(user_input, base_url, user_id, session_id, msg_id)
-            except asyncio.CancelledError:
-                logger.warning("Message handling cancelled")
-                break
-            except KeyboardInterrupt:
-                emit(user_id, "info", "Cancelled")
+                    if not text.strip():
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        continue
+                    if text.lower() == "/compact":
+                        logger.info(f"/compact command from {user_id}")
+                        result = await compact_session(user_id, session_id)
+                        emit(user_id, "info", json.loads(result)["status"])
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        continue
+                    try:
+                        await handle_message(text, base_url, user_id, session_id, msg_id)
+                    except asyncio.CancelledError:
+                        logger.warning("Message handling cancelled")
+                        break
+    except asyncio.CancelledError:
+        logger.warning("Main loop cancelled")
+        raise
     except Exception as e:
         logger.error(f"Main loop error: {e}")
         raise
@@ -660,16 +683,22 @@ async def main(
                 logger.error(f"Stopping llama-server: {e}")
 
 
+CLIENTS = {
+    "terminal": "clients.terminal",
+    "discord_client": "clients.discord_client",
+    "irc_client": "clients.irc_client",
+}
+
+
+def _load_client(client_type: str):
+    try:
+        return importlib.import_module(CLIENTS[client_type])
+    except KeyError:
+        raise ValueError(f"Unknown client type: {client_type}") from None
+
+
 async def async_main(client_type: str, session_id: str | None = None):
-    # Import client module based on command line argument
-    if client_type == "terminal":
-        from clients import terminal as client
-    elif client_type == "discord_client":
-        from clients import discord_client as client
-    elif client_type == "irc_client":
-        from clients import irc_client as client
-    else:
-        raise ValueError(f"Unknown client type: {client_type}")
+    client = _load_client(client_type)
 
     resume = False
     if session_id is not None:
@@ -680,42 +709,20 @@ async def async_main(client_type: str, session_id: str | None = None):
     elif session_id is None:
         session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
+    bus.bind()
     await main_init()
 
-    # Expose usage side-channel and context size to the client (ignored by clients that don't use them)
-    client.usage_events = usage_events
-    client.turn_events = turn_events
-    client.context_size = CONTEXT_SIZE
-
-    # 1. Create your two tasks
-    init_task = asyncio.create_task(client.init(queue_query, get_reponse, set_interrupt))
-    main_task = asyncio.create_task(main(on_ready=client.on_ready, resume=resume, session_id=session_id))
-    tasks = {init_task, main_task}
-
+    init_task = asyncio.create_task(client.run(bus, CONTEXT_SIZE))
+    main_task = asyncio.create_task(main(resume=resume, session_id=session_id))
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
+        await asyncio.wait({init_task, main_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (init_task, main_task):
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        await asyncio.gather(init_task, main_task)
-    except asyncio.CancelledError:
-        logger.info("Received cancellation, cleaning up tasks...")
-        # Cancel all pending tasks
-        init_task.cancel()
-        main_task.cancel()
-        # Wait for tasks to finish with timeout
         try:
             await asyncio.gather(init_task, main_task, return_exceptions=True)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"Error in async_main: {e}")
-        init_task.cancel()
-        main_task.cancel()
-        raise
-    finally:
-        # Always call stop to clean up client
+        except asyncio.CancelledError:
+            logger.info("Cancelled during cleanup")
         try:
             client.stop()
         except Exception as e:
@@ -725,8 +732,6 @@ async def async_main(client_type: str, session_id: str | None = None):
 
 
 if __name__ == "__main__":
-    import os
-
     exec_dir = os.path.dirname(os.path.abspath(__file__))
 
     def load_config():
@@ -734,7 +739,6 @@ if __name__ == "__main__":
             return json.loads(fh.read())
 
     config = load_config()
-    import sys
 
     if len(sys.argv) > 1:
         config["client"] = sys.argv[1]

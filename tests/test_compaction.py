@@ -211,10 +211,15 @@ class TestStages(CompactionBase):
             self.assertIsNone(m["content"])
 
 
-class TestThresholds(CompactionBase):
+class TestThresholds(unittest.TestCase):
+    def _clean_env(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("COMPACTION_")}
+        return mock.patch.dict(os.environ, env, clear=True)
+
     def test_trigger_and_target_default_pct(self):
-        self.assertEqual(compaction.compaction_trigger(1000), 700)
-        self.assertEqual(compaction.compaction_target(1000), 700)
+        with self._clean_env():
+            self.assertEqual(compaction.compaction_trigger(1000), 800)
+            self.assertEqual(compaction.compaction_target(1000), 200)
 
     def test_trigger_and_target_respect_env(self):
         with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "80", "COMPACTION_TARGET_PCT": "20"}):
@@ -223,7 +228,7 @@ class TestThresholds(CompactionBase):
 
     def test_pct_invalid_falls_back_to_default(self):
         with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "abc"}):
-            self.assertEqual(compaction.compaction_trigger(1000), 700)
+            self.assertEqual(compaction.compaction_trigger(1000), 800)
 
     def test_pct_out_of_range_is_clamped(self):
         with mock.patch.dict(os.environ, {"COMPACTION_TRIGGER_PCT": "0", "COMPACTION_TARGET_PCT": "150"}):
