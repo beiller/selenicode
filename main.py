@@ -42,13 +42,12 @@ from logging.handlers import RotatingFileHandler
 
 LOG_FILE = pathlib.Path(__file__).parent / "agent1.log"
 
+# File-only logging: a console handler would write raw text over the terminal
+# client's screen. Everything lands in agent1.log (rotating).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3),
-        logging.StreamHandler(),
-    ],
+    handlers=[RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)],
 )
 logger = logging.getLogger()
 
