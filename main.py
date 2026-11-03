@@ -20,7 +20,7 @@ from typing import AsyncIterator, Callable, Union, get_type_hints
 
 import aiohttp
 
-import config
+from core import config
 
 LOG_FILE = pathlib.Path(__file__).parent / "agent1.log"
 
@@ -35,9 +35,8 @@ logger = logging.getLogger()
 
 
 # Import tools from tools.py
-from download_model import download_model, search_model
-from retry import HttpError, retry_fibonacci
-from tools import (
+from core.retry import HttpError, retry_fibonacci
+from core.tools import (
     change_working_directory,
     conversation_search,
     edit_file,
@@ -203,7 +202,7 @@ async def handle_server_command(user_id: UserID, msg_id: str, text: str) -> None
 # Types – Chat Completions API
 # ---------------------------------------------------------------------------
 
-from bus import (
+from core.bus import (
     Bus,
     CompactionDone,
     Error,
@@ -216,15 +215,15 @@ from bus import (
     UsageReport,
     UserMessage,
 )
-from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
-from conversation import (
+from core.compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
+from core.conversation import (
     approximate_token_count,
     archive_conversation,
     get_last_conversation_session_id,
     read_conversation,
     write_conversation,
 )
-from main_types import (
+from core.main_types import (
     ChatCompletionChunk,
     ChatCompletionRequest,
     Message,
@@ -504,13 +503,11 @@ def build_tools() -> tuple[list[Tool], dict[str, ToolHandler]]:
     tools: list[Tool] = [
         tool_from_function(conversation_search),
         tool_from_function(run_bash),
-        tool_from_function(download_model),
         tool_from_function(load_model),
         tool_from_function(write_file),
         tool_from_function(edit_file),
         tool_from_function(read_file),
         tool_from_function(list_models),
-        tool_from_function(search_model),
         tool_from_function(reset_session),
         tool_from_function(compact_session),
         tool_from_function(change_working_directory),
@@ -522,10 +519,8 @@ def build_tools() -> tuple[list[Tool], dict[str, ToolHandler]]:
         "read_file": read_file,
         "run_bash": run_bash,
         "change_working_directory": change_working_directory,
-        "download_model": download_model,
         "load_model": load_model_and_set,
         "list_models": list_models,
-        "search_model": search_model,
         "reset_session": reset_session,
         "compact_session": compact_session,
     }
@@ -914,7 +909,7 @@ async def async_main(client_type: str, session_id: str | None = None) -> None:
             print(f"Your session id: {session_id}")
 
 
-if __name__ == "__main__":
+def cli() -> None:
     client = config.CLIENT
     if len(sys.argv) > 1:
         client = sys.argv[1]
@@ -923,3 +918,7 @@ if __name__ == "__main__":
         session_id = sys.argv[2]
     # Run the async function with proper cancellation handling
     asyncio.run(async_main(client, session_id))
+
+
+if __name__ == "__main__":
+    cli()

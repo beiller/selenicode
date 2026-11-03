@@ -8,9 +8,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import bus as bus_mod
-import config
 import main
+from core import bus as bus_mod
+from core import config
 
 
 def make_assistant_msg(name: str, args: str) -> dict:

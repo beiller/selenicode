@@ -12,5 +12,6 @@ RUN apt-get update && apt-get install -y git curl wget net-tools iputils-ping jq
 # Copy application code
 COPY . .
 
-# Run the async main function
-CMD ["python", "main.py", "terminal", "true"]
+# Run the async main function; extra args (e.g. a session id) replace CMD
+ENTRYPOINT ["python", "main.py"]
+CMD ["terminal"]

@@ -8,8 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import compaction
-import config
+from core import compaction, config
 
 REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "bakupte6.json"
 

@@ -5,7 +5,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import clients.terminal as t2
-from bus import CompactionDone, Error, History, ServerStatus, Token, TurnDone, UsageReport
+from core.bus import CompactionDone, Error, History, ServerStatus, Token, TurnDone, UsageReport
 
 
 def fill(state: t2.UIState, n: int) -> None:

@@ -3,7 +3,7 @@
 import asyncio
 import time
 
-from bus import Bus, Error, Token
+from core.bus import Bus, Error, Token
 
 
 def rate_limit(calls, period=10):

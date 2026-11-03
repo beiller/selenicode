@@ -6,8 +6,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import Bus, Error, Interrupt, Token, TurnDone
 from clients.common import consume_tokens
+from core.bus import Bus, Error, Interrupt, Token, TurnDone
 
 
 class TestBus(unittest.TestCase):

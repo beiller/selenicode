@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Load environment variables from .env file if it exists
+if [ -f .env.defaults ]; then
+    source .env.defaults
+fi
+
+if [ -f .env ]; then
+    source .env
+fi
+
+ENV_ARGS=()
+if [ -f .env.defaults ]; then
+    ENV_ARGS+=(--env-file .env.defaults)
+fi
+
+EXTRA_ARGS=()
+if [ -n "${1:-}" ]; then
+    EXTRA_ARGS=("terminal" "$1")
+fi
+
+podman build -t selenicode .
+podman run -it --rm "${ENV_ARGS[@]}" --network=host -v ./conversations:/app/conversations selenicode "${EXTRA_ARGS[@]}"

@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools import edit_file, read_file, write_file
+from core.tools import edit_file, read_file, write_file
 
 
 def ok(result: str) -> dict:

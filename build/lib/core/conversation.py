@@ -3,7 +3,7 @@ import pathlib
 from datetime import datetime
 from typing import List
 
-from main_types import Message, SessionID
+from core.main_types import Message, SessionID
 
 ROOT_DIR = pathlib.Path(__file__).parent
 CONVERSATION_DIR = ROOT_DIR / "conversations"

@@ -3,10 +3,10 @@ import logging
 
 import aiohttp
 
-import config
-from conversation import approximate_token_count
-from main_types import Message, SessionID
-from retry import HttpError, retry_fibonacci
+from core import config
+from core.conversation import approximate_token_count
+from core.main_types import Message, SessionID
+from core.retry import HttpError, retry_fibonacci
 
 logger = logging.getLogger()
 

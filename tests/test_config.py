@@ -7,12 +7,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
+from core import config
 
 
 class TestConfigLoading(unittest.TestCase):
     def setUp(self):
-        self.root = pathlib.Path(config.__file__).parent
+        self.root = pathlib.Path(config.__file__).parent.parent  # config lives in core/
         self.live = self.root / "config.json"
         self.backup = self.root / "config.json.test-backup"
 

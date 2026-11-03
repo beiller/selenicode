@@ -30,7 +30,7 @@ import unicodedata
 import uuid
 from typing import Callable
 
-from bus import (
+from core.bus import (
     Bus,
     CompactionDone,
     Error,

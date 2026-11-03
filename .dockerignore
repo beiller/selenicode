@@ -1,3 +1,17 @@
 models/
 venv/
 .cache
+.git
+__pycache__
+*.pyc
+llama.cpp
+llama.cpp-build.tar.gz
+opencode
+nohup.out
+agent1.log*
+conversations
+.pytest_cache
+.ruff_cache
+*.pem
+aws_cmd.py
+.env

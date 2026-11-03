@@ -9,10 +9,10 @@ import pathlib
 import re
 import urllib.request
 
-import config
-from main_types import FunctionParameters, Tool, ToolHandler
-from retry import retry_fibonacci
-from search import search as _search
+from core import config
+from core.main_types import FunctionParameters, Tool, ToolHandler
+from core.retry import retry_fibonacci
+from core.search import search as _search
 
 
 def make_tool(

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selenicode"
+version = "0.1.0"
+description = "Local-first coding assistant with terminal, Discord and IRC clients"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp==3.13.3",
+    "discord==2.3.2",
+    "irc==20.5.0",
+    "python-dotenv==1.2.2",
+]
+
+[project.scripts]
+selenicode = "main:cli"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["core"]

@@ -11,8 +11,9 @@ _DEFAULTS = {
 def _load() -> dict:
     """Built-ins <- config.defaults.json (repo) <- config.json (local, wins)."""
     data = json.loads(json.dumps(_DEFAULTS))
+    root = pathlib.Path(__file__).parent.parent  # project root (this file lives in core/)
     for name in ("config.defaults.json", "config.json"):
-        path = pathlib.Path(__file__).parent / name
+        path = root / name
         if path.exists():
             with open(path) as fh:
                 user = json.load(fh)

@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from retry import HttpError, retry_fibonacci
+from core.retry import HttpError, retry_fibonacci
 
 
 class TestRetryFibonacci(unittest.TestCase):

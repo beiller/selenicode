@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from bus import Bus, Interrupt, UserMessage
+from core.bus import Bus, Interrupt, UserMessage
 
 from .common import async_rate_limit, consume_tokens
 

@@ -8,7 +8,7 @@ from typing import Callable
 
 import irc.client
 
-from bus import Bus, UserMessage
+from core.bus import Bus, UserMessage
 
 from .common import consume_tokens, rate_limit
 
