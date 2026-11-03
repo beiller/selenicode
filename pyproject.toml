@@ -19,4 +19,4 @@ selenicode = "main:cli"
 
 [tool.setuptools]
 py-modules = ["main"]
-packages = ["core"]
+packages = ["core", "clients"]

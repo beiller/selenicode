@@ -2,9 +2,9 @@ import json
 import re
 import sqlite3
 import sys
-from pathlib import Path
 
-ROOT_DIR = Path(__file__).parent.parent  # project root (this file lives in core/)
+from core.config import ROOT_DIR
+
 CONVERSATIONS_DIR = ROOT_DIR / "conversations"
 DB = CONVERSATIONS_DIR / "conversations.db"
 DIR = CONVERSATIONS_DIR

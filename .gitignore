@@ -16,3 +16,4 @@ local_skills/*
 agent1.log*
 *.egg-info
 dist
+build

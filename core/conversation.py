@@ -1,11 +1,10 @@
 import json
-import pathlib
 from datetime import datetime
 from typing import List
 
+from core.config import ROOT_DIR
 from core.main_types import Message, SessionID
 
-ROOT_DIR = pathlib.Path(__file__).parent.parent  # project root (this file lives in core/)
 CONVERSATION_DIR = ROOT_DIR / "conversations"
 
 

@@ -5,15 +5,26 @@ import pathlib
 _DEFAULTS = {
     "client": "terminal",
     "server": {"url": "", "api_key": "", "model": ""},
+    "compaction": {"tail_turns": 10, "trigger_pct": 80.0, "target_pct": 30.0},
 }
+
+
+def _find_root() -> pathlib.Path:
+    # cwd when it holds a config file (pip-installed runs), else the source tree.
+    cwd = pathlib.Path.cwd()
+    if (cwd / "config.defaults.json").exists() or (cwd / "config.json").exists():
+        return cwd
+    return pathlib.Path(__file__).parent.parent  # project root (this file lives in core/)
+
+
+ROOT_DIR = _find_root()
 
 
 def _load() -> dict:
     """Built-ins <- config.defaults.json (repo) <- config.json (local, wins)."""
     data = json.loads(json.dumps(_DEFAULTS))
-    root = pathlib.Path(__file__).parent.parent  # project root (this file lives in core/)
     for name in ("config.defaults.json", "config.json"):
-        path = root / name
+        path = ROOT_DIR / name
         if path.exists():
             with open(path) as fh:
                 user = json.load(fh)

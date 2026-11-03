@@ -7,7 +7,6 @@ import importlib
 import inspect
 import json
 import logging
-import pathlib
 import random
 import string
 import sys
@@ -22,7 +21,7 @@ import aiohttp
 
 from core import config
 
-LOG_FILE = pathlib.Path(__file__).parent / "agent1.log"
+LOG_FILE = config.ROOT_DIR / "agent1.log"
 
 # File-only logging: a console handler would write raw text over the terminal
 # client's screen. Everything lands in agent1.log (rotating).
@@ -284,7 +283,7 @@ def make_tool_result_message(tool_call_id: str, content: str) -> Message:
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT_DIR = pathlib.Path(__file__).parent
+ROOT_DIR = config.ROOT_DIR
 SYSTEM_MD = ROOT_DIR / "SYSTEM.md"
 SKILLS_DIR = ROOT_DIR / "skills"
 LOCAL_SKILLS_DIR = ROOT_DIR / "local_skills"
