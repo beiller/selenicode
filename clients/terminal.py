@@ -221,7 +221,7 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
     # viewport shrinks to fit.
     rows.extend(_input_block_rows(input_lines, width))
     if not state.input_buf:
-        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit · ctrl+t show thinking", STY_DIM))
+        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit · ctrl+t show thinking · /help for commands", STY_DIM))
     return rows
 
 

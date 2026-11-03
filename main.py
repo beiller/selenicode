@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import inspect
 import json
+import logging
 import os
 import pathlib
 import random
@@ -15,30 +16,12 @@ import threading
 import types
 import urllib.request
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import AsyncIterator, Callable, Union, get_type_hints
 
 import aiohttp
 
-# Load environment variables with priority order
-# 1. .env.defaults
-# 2. .env (user overrides - if exists)
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv(".env.defaults", override=False)
-
-    if os.path.exists(".env"):
-        load_dotenv(".env", override=True)
-
-    # Set fallback defaults if neither file has them
-    if "LLAMA_BASE_URL" not in os.environ:
-        os.environ["LLAMA_BASE_URL"] = "http://127.0.0.1:8080"
-except ImportError:
-    # If python-dotenv is not installed, use hardcoded defaults
-    if "LLAMA_BASE_URL" not in os.environ:
-        os.environ["LLAMA_BASE_URL"] = "http://127.0.0.1:8080"
-import logging
-from logging.handlers import RotatingFileHandler
+import config
 
 LOG_FILE = pathlib.Path(__file__).parent / "agent1.log"
 
@@ -70,11 +53,18 @@ from tools import (
     write_file,
 )
 
-CURRENT_MODEL = os.environ.get("CURRENT_MODEL", "Qwen_Qwen3.5-27B-Q4_1")
+CURRENT_MODEL = config.CURRENT_MODEL
 # Context size is mandatory and only ever taken from the server; None until resolved.
 CONTEXT_SIZE: int | None = None
 ctx_ready = asyncio.Event()
+ctx_task: asyncio.Task | None = None
 shutdown = asyncio.Event()
+
+SLASH_COMMANDS = [
+    ("/compact", "summarize older conversation to free context space"),
+    ("/server <url> [key]", "switch to a different model server (eg http(s)://localhost:8080, optional API key)"),
+    ("/help", "show this list"),
+]
 
 
 async def _run_daemon(fn, *args):
@@ -114,7 +104,7 @@ def load_model_and_set(model_name: str):
 
 def _fetch_models_once(base_url: str) -> list[dict]:
     """Single-attempt fetch of the model list (the retry loop lives in wait_for_context_size)."""
-    req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
+    req = urllib.request.Request(f"{base_url}/v1/models", method="GET", headers=config.auth_headers())
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode("utf-8")).get("data", [])
 
@@ -136,7 +126,6 @@ async def wait_for_context_size() -> None:
 
     Every failed attempt surfaces an error to the user with the next retry delay (capped Fibonacci)."""
     global CONTEXT_SIZE
-    base_url = os.getenv("LLAMA_BASE_URL")
     bus.outbound.put_nowait(ServerStatus(False))
     attempt = 0
     delay_a, delay_b = 1.0, 1.0
@@ -145,7 +134,7 @@ async def wait_for_context_size() -> None:
             return
         attempt += 1
         try:
-            models = await _run_daemon(_fetch_models_once, base_url)
+            models = await _run_daemon(_fetch_models_once, config.BASE_URL)
             n_ctx = _parse_context_size(models)
             if n_ctx is None:
                 raise RuntimeError(f"No context size in model list for {CURRENT_MODEL}")
@@ -172,6 +161,38 @@ async def startup_load_model() -> None:
         await _run_daemon(load_model_and_set, CURRENT_MODEL)
     except Exception as e:
         logger.error(f"Model load at startup failed: {e!r}; continuing")
+
+
+async def handle_server_command(user_id: UserID, msg_id: str, text: str) -> None:
+    """`/server <url> [api_key]`: point this program at a different model server.
+
+    The argument is the full base URL (scheme + host + port), used verbatim;
+    the optional api key replaces any configured one (a bare URL clears it).
+    Cancels any in-flight fetcher (its stale attempt is discarded by _run_daemon)
+    and starts a fresh one, so the context-size check begins immediately against
+    the new URL with the usual retry error messages. Resets the context-size gate
+    so the next turn blocks until the new server reports its size."""
+    global CONTEXT_SIZE, ctx_task
+    parts = text.split()
+    if len(parts) not in (2, 3):
+        report_error(user_id, "Usage: /server <url> [api_key] (eg http(s)://localhost:8080)")
+        bus.outbound.put_nowait(TurnDone(msg_id))
+        return
+    url = parts[1].strip()
+    host = url.split("://", 1)[1] if url.startswith(("http://", "https://")) else ""
+    if not host:
+        report_error(user_id, f"Invalid server URL (need full URL with http/https scheme): {url}")
+        bus.outbound.put_nowait(TurnDone(msg_id))
+        return
+    config.BASE_URL = url
+    config.API_KEY = parts[2] if len(parts) == 3 else ""
+    if ctx_task is not None and not ctx_task.done():
+        ctx_task.cancel()
+    CONTEXT_SIZE = None
+    ctx_ready.clear()
+    ctx_task = asyncio.create_task(wait_for_context_size())
+    logger.info(f"/server: switched to {url} (from {user_id})")
+    bus.outbound.put_nowait(TurnDone(msg_id))
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +345,7 @@ async def _open_chat_stream(
         resp = await session.post(
             f"{base_url}/v1/chat/completions",
             json=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **config.auth_headers()},
             timeout=aiohttp.ClientTimeout(sock_read=None, sock_connect=5 * 60, connect=5 * 60),
         )
         if resp.status != 200:
@@ -697,7 +718,7 @@ def reset_session(user_id: UserID = "", session_id: SessionID = ""):
 
 async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     "Compact the current conversation to free context space: prune old tool outputs, replace older history with a structured summary, keep recent turns verbatim"
-    base_url = os.getenv("LLAMA_BASE_URL")
+    base_url = config.BASE_URL
     messages: list[Message] = get_user_messages(user_id)
     if not _safe_to_write(session_id, messages):
         logger.error(f"Refusing to compact: in-memory list for {user_id} is empty but session {session_id} has content on disk")
@@ -712,7 +733,6 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
 
 
 async def main(resume: bool = False, session_id: str | None = None) -> None:
-    base_url = os.getenv("LLAMA_BASE_URL")
     session_resumed = False
     try:
         while True:
@@ -725,6 +745,17 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                     continue
                 case UserMessage(user_id, text, msg_id):
                     bus.interrupted.discard(user_id)  # a stale interrupt must not cancel the new turn
+                    if not text.strip():
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        continue
+                    # /server must work before the gate: it is how you fix a wrong/unreachable server.
+                    if text.lower().startswith("/server"):
+                        await handle_server_command(user_id, msg_id, text)
+                        continue
+                    if text.lower() == "/help":
+                        emit(user_id, "info", "Available commands:\n" + "\n".join(f"{name:<15} {desc}" for name, desc in SLASH_COMMANDS))
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        continue
                     if CONTEXT_SIZE is None:
                         emit(user_id, "info", "Waiting for model server - context size not yet determined")
                         await ctx_ready.wait()
@@ -734,9 +765,6 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                         set_user_messages(user_id, read_conversation(session_id))
                         session_resumed = True
 
-                    if not text.strip():
-                        bus.outbound.put_nowait(TurnDone(msg_id))
-                        continue
                     if text.lower() == "/compact":
                         logger.info(f"/compact command from {user_id}")
                         try:
@@ -754,7 +782,7 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                             bus.outbound.put_nowait(CompactionDone(user_id, context_token_count(get_user_messages(user_id))))
                         continue
                     try:
-                        await handle_message(text, base_url, user_id, session_id, msg_id)
+                        await handle_message(text, config.BASE_URL, user_id, session_id, msg_id)
                     except asyncio.CancelledError:
                         logger.warning("Message handling cancelled")
                         break
@@ -783,7 +811,8 @@ def _load_client(client_type: str):
         raise ValueError(f"Unknown client type: {client_type}") from None
 
 
-async def async_main(client_type: str, session_id: str | None = None):
+async def async_main(client_type: str, session_id: str | None = None) -> None:
+    global ctx_task
     client = _load_client(client_type)
 
     resume = False
@@ -833,12 +862,12 @@ if __name__ == "__main__":
         with open(f"{exec_dir}/config.json") as fh:
             return json.loads(fh.read())
 
-    config = load_config()
+    cfg = load_config()
 
     if len(sys.argv) > 1:
-        config["client"] = sys.argv[1]
+        cfg["client"] = sys.argv[1]
     session_id: str | None = None
     if len(sys.argv) > 2:
         session_id = sys.argv[2]
     # Run the async function with proper cancellation handling
-    asyncio.run(async_main(config.get("client", "terminal"), session_id))
+    asyncio.run(async_main(cfg.get("client", "terminal"), session_id))

@@ -9,6 +9,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bus as bus_mod
+import config
 import main
 
 
@@ -569,6 +570,153 @@ class TestContextSizeGate(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertEqual(ran["n"], 1)
+
+
+    def test_fetch_models_sends_api_key_header_only_when_set(self):
+        old = config.API_KEY
+        try:
+            for key, expect in (("sekret", "Bearer sekret"), ("", None)):
+                config.API_KEY = key
+                with mock.patch.object(main.urllib.request, "Request") as fake_req, mock.patch.object(
+                    main.urllib.request, "urlopen"
+                ) as fake_open:
+                    fake_open.return_value.__enter__.return_value.read.return_value = b'{"data": []}'
+                    main._fetch_models_once("http://x")
+                headers = fake_req.call_args.kwargs.get("headers", {})
+                self.assertEqual(headers.get("Authorization"), expect)
+        finally:
+            config.API_KEY = old
+
+
+class TestServerCommand(unittest.TestCase):
+    def setUp(self):
+        self._old_url = config.BASE_URL
+        self._old_key = config.API_KEY
+        config.BASE_URL = "http://old.example:8080"
+        config.API_KEY = "oldkey"
+        main.CONTEXT_SIZE = 16384
+        # fresh events: asyncio.Event binds to the first loop that uses it and never rebinds
+        main.ctx_ready = asyncio.Event()
+        main.ctx_ready.set()
+        main.ctx_task = None
+
+    def tearDown(self):
+        config.BASE_URL = self._old_url
+        config.API_KEY = self._old_key
+        main.CONTEXT_SIZE = None
+        main.ctx_task = None
+        main.ctx_ready = asyncio.Event()
+
+    def test_server_switches_url_and_resets_gate(self):
+        spawned = {"n": 0}
+
+        async def fake_wait():
+            spawned["n"] += 1
+            await asyncio.sleep(30)
+
+        async def old_fetcher():
+            await asyncio.sleep(30)  # simulates the retry loop, possibly mid-backoff
+
+        async def scenario():
+            b = bus_mod.Bus()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "wait_for_context_size", fake_wait
+            ):
+                b.bind()
+                old = asyncio.create_task(old_fetcher())
+                main.ctx_task = old
+                b.post(bus_mod.UserMessage("u1", "/server http://new.example:9000 secret123", "m1"))
+                b.post(bus_mod.Shutdown())
+                await asyncio.wait_for(asyncio.create_task(main.main()), timeout=2)
+                await asyncio.sleep(0.01)
+                self.assertTrue(old.cancelled())  # stale retry loop must not delay the switch
+
+        asyncio.run(scenario())
+        self.assertEqual(config.BASE_URL, "http://new.example:9000")  # used verbatim
+        self.assertEqual(config.API_KEY, "secret123")
+        self.assertIsNone(main.CONTEXT_SIZE)
+        self.assertFalse(main.ctx_ready.is_set())
+        self.assertEqual(spawned["n"], 1)  # fresh fetcher starts immediately against the new URL
+
+    def test_server_bad_args_report_error_and_leave_state_untouched(self):
+        errors = []
+
+        async def scenario():
+            b = bus_mod.Bus()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "report_error", lambda uid, msg, exc=None: errors.append(msg)
+            ):
+                b.bind()
+                b.post(bus_mod.UserMessage("u1", "/server", "m1"))
+                b.post(bus_mod.UserMessage("u1", "/server a b", "m2"))
+                b.post(bus_mod.UserMessage("u1", "/server newhost.example", "m3"))  # no scheme
+                b.post(bus_mod.Shutdown())
+                await asyncio.wait_for(asyncio.create_task(main.main()), timeout=2)
+
+        asyncio.run(scenario())
+        self.assertEqual(config.BASE_URL, "http://old.example:8080")
+        self.assertEqual(config.API_KEY, "oldkey")  # bad args must not touch the key either
+        self.assertEqual(main.CONTEXT_SIZE, 16384)
+        self.assertTrue(main.ctx_ready.is_set())
+        self.assertGreaterEqual(len(errors), 3)
+
+    def test_turn_gated_again_after_server_switch(self):
+        ran = {"n": 0}
+
+        async def ok_handle(text, base_url, user_id, session_id, msg_id):
+            ran["n"] += 1
+
+        async def scenario():
+            b = bus_mod.Bus()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "handle_message", ok_handle
+            ), mock.patch.object(
+                main, "wait_for_context_size", lambda: asyncio.sleep(30)
+            ):
+                b.bind()
+                b.post(bus_mod.UserMessage("u1", "/server http://new.example:9000", "m1"))  # bare URL clears the key
+                b.post(bus_mod.UserMessage("u1", "hello", "m2"))
+                task = asyncio.create_task(main.main())
+                await asyncio.sleep(0.1)
+                self.assertEqual(ran["n"], 0)  # the turn must wait for the new server's context size
+                main.CONTEXT_SIZE = 8192
+                main.ctx_ready.set()
+                b.post(bus_mod.Shutdown())
+                await asyncio.wait_for(task, timeout=2)
+
+        asyncio.run(scenario())
+        self.assertEqual(ran["n"], 1)
+        self.assertEqual(config.API_KEY, "")  # bare URL cleared the previously set key
+
+
+class TestHelpCommand(unittest.TestCase):
+    def setUp(self):
+        self._old_ctx = main.CONTEXT_SIZE
+        main.CONTEXT_SIZE = None  # gate unresolved: /help must not block on the server
+
+    def tearDown(self):
+        main.CONTEXT_SIZE = self._old_ctx
+
+    def test_help_lists_commands_pre_gate(self):
+        events = []
+
+        async def scenario():
+            b = bus_mod.Bus()
+            with mock.patch.object(main, "bus", b):
+                b.bind()
+                b.post(bus_mod.UserMessage("u1", "/help", "m1"))
+                b.post(bus_mod.Shutdown())
+                await asyncio.wait_for(asyncio.create_task(main.main()), timeout=2)
+                while True:
+                    try:
+                        events.append(b.outbound.get_nowait())
+                    except Exception:
+                        break
+
+        asyncio.run(scenario())
+        help_texts = [e.text for e in events if isinstance(e, bus_mod.Token)]
+        self.assertTrue(any("/compact" in t and "/server" in t and "/help" in t for t in help_texts))
+        self.assertTrue(any(isinstance(e, bus_mod.TurnDone) for e in events))
 
 
 if __name__ == "__main__":

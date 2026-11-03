@@ -9,6 +9,7 @@ import pathlib
 import re
 import urllib.request
 
+import config
 from main_types import FunctionParameters, Tool, ToolHandler
 from retry import retry_fibonacci
 from search import search as _search
@@ -560,11 +561,13 @@ def load_model(model_name: str) -> str:
     Returns:
         JSON string with success status and details
     """
-    base_url = os.getenv("LLAMA_BASE_URL")
+    base_url = config.BASE_URL
     url = f"{base_url}/models/load"
     data = json.dumps({"model": model_name}).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json", **config.auth_headers()}, method="POST"
+    )
 
     with urllib.request.urlopen(req, timeout=60) as response:
         result = json.loads(response.read().decode("utf-8"))
@@ -583,11 +586,13 @@ def unload_model(model_name: str) -> str:
     Returns:
         JSON string with success status and details
     """
-    base_url = os.getenv("LLAMA_BASE_URL")
+    base_url = config.BASE_URL
     url = f"{base_url}/models/unload"
     data = json.dumps({"model": model_name}).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json", **config.auth_headers()}, method="POST"
+    )
 
     with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(response.read().decode("utf-8"))
@@ -597,8 +602,8 @@ def unload_model(model_name: str) -> str:
 @retry_fibonacci()
 def get_loaded_model() -> str | None:
     """Return the loaded model name, or None if no model is currently loaded."""
-    base_url = os.getenv("LLAMA_BASE_URL")
-    req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
+    base_url = config.BASE_URL
+    req = urllib.request.Request(f"{base_url}/v1/models", method="GET", headers=config.auth_headers())
     with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(response.read().decode("utf-8"))
         for model in result.get("data", []):
@@ -617,10 +622,10 @@ def list_models() -> str:
     Returns:
         JSON string with list of models and their status
     """
-    base_url = os.getenv("LLAMA_BASE_URL")
+    base_url = config.BASE_URL
     url = f"{base_url}/models"
 
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method="GET", headers=config.auth_headers())
 
     with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(response.read().decode("utf-8"))
