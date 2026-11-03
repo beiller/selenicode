@@ -1,17 +1,25 @@
 import json
 import pathlib
 
-# Single source of truth: built-in defaults, overridden by config.json (project root).
+# Last-resort built-ins; config.defaults.json (repo) and config.json (local, untracked) override them.
 _DEFAULTS = {
     "client": "terminal",
-    "server": {"url": "http://127.0.0.1:8080", "api_key": "", "model": "Qwen_Qwen3.5-27B-Q4_1"},
+    "server": {"url": "", "api_key": "", "model": ""},
     "compaction": {"tail_turns": 6, "trigger_pct": 80.0, "target_pct": 30.0},
 }
 
 
+def _config_path() -> pathlib.Path:
+    """Prefer the local config.json; fall back to the repo's config.defaults.json."""
+    path = pathlib.Path(__file__).parent / "config.json"
+    if not path.exists():
+        return pathlib.Path(__file__).parent / "config.defaults.json"
+    return path
+
+
 def _load() -> dict:
     data = json.loads(json.dumps(_DEFAULTS))
-    path = pathlib.Path(__file__).parent / "config.json"
+    path = _config_path()
     if path.exists():
         with open(path) as fh:
             user = json.load(fh)

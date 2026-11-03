@@ -688,6 +688,44 @@ class TestServerCommand(unittest.TestCase):
         self.assertEqual(ran["n"], 1)
         self.assertEqual(config.API_KEY, "")  # bare URL cleared the previously set key
 
+    def test_server_interrupts_a_prompt_blocked_at_the_gate(self):
+        """Deadlock regression: a /server typed while a prompt blocks at the gate must be served immediately."""
+        handled = []
+
+        async def ok_handle(text, base_url, user_id, session_id, msg_id):
+            handled.append(text)
+
+        async def scenario():
+            b = bus_mod.Bus()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "handle_message", ok_handle
+            ), mock.patch.object(main, "wait_for_context_size", lambda: asyncio.sleep(30)):
+                b.bind()
+                main.CONTEXT_SIZE = None
+                main.ctx_ready = asyncio.Event()  # fresh event: binds to the first loop that uses it
+                b.post(bus_mod.UserMessage("u1", "hello", "m1"))  # blocks at the gate
+                task = asyncio.create_task(main.main())
+                await asyncio.sleep(0.05)
+                self.assertEqual(handled, [])  # still gated
+                b.post(bus_mod.UserMessage("u1", "/server http://new.example:9000", "m2"))
+                for _ in range(300):
+                    if config.BASE_URL == "http://new.example:9000":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(config.BASE_URL, "http://new.example:9000")  # served while gated (no deadlock)
+                main.CONTEXT_SIZE = 8192
+                main.ctx_ready.set()
+                b.post(bus_mod.Shutdown())
+                await asyncio.wait_for(task, timeout=2)
+
+        old_url = config.BASE_URL
+        try:
+            config.BASE_URL = "http://old.example:8080"
+            asyncio.run(scenario())
+        finally:
+            config.BASE_URL = old_url
+        self.assertEqual(handled, ["hello"])  # the gated prompt runs after the gate opens, in order
+
 
 class TestHelpCommand(unittest.TestCase):
     def setUp(self):

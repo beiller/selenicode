@@ -1,0 +1,8 @@
+{
+    "client": "terminal",
+    "server": {
+        "url": "",
+        "api_key": "",
+        "model": ""
+    }
+}

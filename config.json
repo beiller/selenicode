@@ -1,8 +1,0 @@
-{
-    "client": "terminal",
-    "server": {
-        "url": "http://100.111.8.95:8300",
-        "api_key": "",
-        "model": "Qwen3.8-27B-Q4_K_M"
-    }
-}

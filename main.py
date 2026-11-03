@@ -133,6 +133,8 @@ async def wait_for_context_size() -> None:
             return
         attempt += 1
         try:
+            if not config.BASE_URL:
+                raise RuntimeError("no server URL configured (set 'server.url' in config.json)")
             models = await _run_daemon(_fetch_models_once, config.BASE_URL)
             n_ctx = _parse_context_size(models)
             if n_ctx is None:
@@ -155,6 +157,9 @@ async def wait_for_context_size() -> None:
 
 async def startup_load_model() -> None:
     """Load the model in the background; management endpoints may not exist (e.g. vLLM)."""
+    if not CURRENT_MODEL:
+        logger.info("No model configured; skipping startup load")
+        return
     logger.info(f"Loading model {CURRENT_MODEL}")
     try:
         await _run_daemon(load_model_and_set, CURRENT_MODEL)
@@ -731,63 +736,118 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     return json.dumps({"status": f"Compaction complete. Context size is {size} of {CONTEXT_SIZE}"})
 
 
+def _is_gate_command(event) -> bool:
+    """Commands that must work while the context-size gate is closed."""
+    return isinstance(event, UserMessage) and (
+        event.text.lower().startswith("/server") or event.text.lower() == "/help"
+    )
+
+
 async def main(resume: bool = False, session_id: str | None = None) -> None:
     session_resumed = False
+
+    async def _process_event(event) -> bool:
+        """Process one inbound event; return False to stop the main loop."""
+        nonlocal session_resumed
+        match event:
+            case Shutdown():
+                return False
+            case Interrupt(user_id):
+                bus.interrupted.add(user_id)  # already set by Bus.post; keeps queue-drain consistent
+                return True
+            case UserMessage(user_id, text, msg_id):
+                bus.interrupted.discard(user_id)  # a stale interrupt must not cancel the new turn
+                if not text.strip():
+                    bus.outbound.put_nowait(TurnDone(msg_id))
+                    return True
+                # /server must work before the gate: it is how you fix a wrong/unreachable server.
+                if text.lower().startswith("/server"):
+                    await handle_server_command(user_id, msg_id, text)
+                    return True
+                if text.lower() == "/help":
+                    emit(user_id, "info", "Available commands:\n" + "\n".join(f"{name:<15} {desc}" for name, desc in SLASH_COMMANDS))
+                    bus.outbound.put_nowait(TurnDone(msg_id))
+                    return True
+                if CONTEXT_SIZE is None:  # defensive; main() gates prompts before dispatch
+                    emit(user_id, "info", "Waiting for model server - context size not yet determined")
+                    await ctx_ready.wait()
+
+                # load the conversation up once hacky TODO
+                if resume and not session_resumed:
+                    set_user_messages(user_id, read_conversation(session_id))
+                    session_resumed = True
+
+                if text.lower() == "/compact":
+                    logger.info(f"/compact command from {user_id}")
+                    try:
+                        result = json.loads(await compact_session(user_id, session_id))
+                    except Exception as e:
+                        report_error(user_id, "Compaction failed", e)
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        return True
+                    if "error" in result:
+                        report_error(user_id, result["error"])
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                    else:
+                        # Posted after TurnDone so the status line keeps the message (TurnDone resets it to "ready").
+                        bus.outbound.put_nowait(TurnDone(msg_id))
+                        bus.outbound.put_nowait(CompactionDone(user_id, context_token_count(get_user_messages(user_id))))
+                    return True
+                try:
+                    await handle_message(text, config.BASE_URL, user_id, session_id, msg_id)
+                except asyncio.CancelledError:
+                    logger.warning("Message handling cancelled")
+                    return False
+                except Exception as e:
+                    # A failed turn must not kill the process; surface it and keep serving.
+                    report_error(user_id, "Turn failed", e)
+                return True
+
+    async def _wait_for_gate() -> list:
+        """Wait for the context-size gate; /server and /help are served while waiting.
+
+        A /server mid-wait restarts the fetcher, so the wait re-arms against the new
+        URL. Other events are held (returned) for in-order processing once the gate opens."""
+        held = []
+        while CONTEXT_SIZE is None:
+            get_task = asyncio.create_task(bus.inbound.get())
+            ready_task = asyncio.create_task(ctx_ready.wait())
+            try:
+                await asyncio.wait({get_task, ready_task}, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                get_task.cancel()
+                ready_task.cancel()
+                raise
+            if ctx_ready.is_set():
+                if get_task.done():  # arrived with the gate opening; process it after the gated event
+                    held.append(get_task.result())
+                else:
+                    get_task.cancel()
+                break
+            event = get_task.result()
+            if _is_gate_command(event):
+                await _process_event(event)
+            else:
+                held.append(event)
+        return held
+
     try:
         while True:
             event = await bus.inbound.get()
-            match event:
-                case Shutdown():
-                    break
-                case Interrupt(user_id):
-                    bus.interrupted.add(user_id)  # already set by Bus.post; keeps queue-drain consistent
-                    continue
-                case UserMessage(user_id, text, msg_id):
-                    bus.interrupted.discard(user_id)  # a stale interrupt must not cancel the new turn
-                    if not text.strip():
-                        bus.outbound.put_nowait(TurnDone(msg_id))
-                        continue
-                    # /server must work before the gate: it is how you fix a wrong/unreachable server.
-                    if text.lower().startswith("/server"):
-                        await handle_server_command(user_id, msg_id, text)
-                        continue
-                    if text.lower() == "/help":
-                        emit(user_id, "info", "Available commands:\n" + "\n".join(f"{name:<15} {desc}" for name, desc in SLASH_COMMANDS))
-                        bus.outbound.put_nowait(TurnDone(msg_id))
-                        continue
-                    if CONTEXT_SIZE is None:
-                        emit(user_id, "info", "Waiting for model server - context size not yet determined")
-                        await ctx_ready.wait()
-
-                    # load the conversation up once hacky TODO
-                    if resume and not session_resumed:
-                        set_user_messages(user_id, read_conversation(session_id))
-                        session_resumed = True
-
-                    if text.lower() == "/compact":
-                        logger.info(f"/compact command from {user_id}")
-                        try:
-                            result = json.loads(await compact_session(user_id, session_id))
-                        except Exception as e:
-                            report_error(user_id, "Compaction failed", e)
-                            bus.outbound.put_nowait(TurnDone(msg_id))
-                            continue
-                        if "error" in result:
-                            report_error(user_id, result["error"])
-                            bus.outbound.put_nowait(TurnDone(msg_id))
-                        else:
-                            # Posted after TurnDone so the status line keeps the message (TurnDone resets it to "ready").
-                            bus.outbound.put_nowait(TurnDone(msg_id))
-                            bus.outbound.put_nowait(CompactionDone(user_id, context_token_count(get_user_messages(user_id))))
-                        continue
-                    try:
-                        await handle_message(text, config.BASE_URL, user_id, session_id, msg_id)
-                    except asyncio.CancelledError:
-                        logger.warning("Message handling cancelled")
-                        break
-                    except Exception as e:
-                        # A failed turn must not kill the process; surface it and keep serving.
-                        report_error(user_id, "Turn failed", e)
+            if (
+                isinstance(event, UserMessage)
+                and event.text.strip()
+                and not _is_gate_command(event)
+                and CONTEXT_SIZE is None
+            ):
+                emit(event.user_id, "info", "Waiting for model server - context size not yet determined")
+                held = await _wait_for_gate()
+                batch = [event, *held]
+            else:
+                batch = [event]
+            for ev in batch:
+                if not await _process_event(ev):
+                    return
     except asyncio.CancelledError:
         logger.warning("Main loop cancelled")
         raise
