@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import clients.terminal_v2 as t2
+import clients.terminal as t2
 from bus import History, Token, TurnDone, UsageReport
 
 
@@ -60,19 +60,37 @@ class TestRenderFrame(unittest.TestCase):
         self.assertEqual(rows[view_h - 1][0][0], "line 29")
         self.assertEqual(rows[0][0][0], "line 22")
 
-    def test_scroll_up_offsets_window(self):
+    def test_detached_view_offsets_window(self):
         state = t2.UIState()
         fill(state, 30)
-        state.scroll_up = 5
+        state.view_top = 17  # bottom (22) minus 5
         rows = t2.render_frame(state, height=10, width=80)
         self.assertEqual(rows[7][0][0], "line 24")
 
-    def test_scroll_up_clamped_at_top(self):
+    def test_detached_view_clamped_at_top(self):
         state = t2.UIState()
         fill(state, 30)
-        state.scroll_up = 10**9
+        state.view_top = 0
         rows = t2.render_frame(state, height=10, width=80)
         self.assertEqual(rows[0][0][0], "line 0")
+
+    def test_detached_view_stays_put_while_streaming(self):
+        state = t2.UIState()
+        fill(state, 30)
+        state.view_top = 17
+        rows_before = t2.render_frame(state, height=10, width=80)
+        # more content arrives (streaming) while the user is reading
+        fill(state, 40)
+        rows_after = t2.render_frame(state, height=10, width=80)
+        self.assertEqual(rows_before[0][0][0], rows_after[0][0][0])
+        self.assertEqual(rows_after[0][0][0], "line 17")
+
+    def test_count_lines(self):
+        state = t2.UIState()
+        fill(state, 3)
+        self.assertEqual(t2.count_lines(state, 80), 3)
+        t2.apply_token(state, "assistant", "abc", True)
+        self.assertEqual(t2.count_lines(state, 80), 4)
 
     def test_prompt_hint_only_when_empty(self):
         state = t2.UIState()
@@ -176,23 +194,29 @@ class TestApplyKey(unittest.TestCase):
 
     def test_page_up_down_and_end(self):
         fill(self_state := self._state(), 50)
-        action, _ = t2.apply_key(self_state, t2.K_PPAGE, view_h=10)
+        action, _ = t2.apply_key(self_state, t2.K_PPAGE, view_h=10, total=50)
         self.assertEqual(action, "")
-        self.assertEqual(self_state.scroll_up, 9)
-        t2.apply_key(self_state, t2.K_NPAGE, view_h=10)
-        self.assertEqual(self_state.scroll_up, 0)
+        self.assertEqual(self_state.view_top, 31)  # bottom (40) minus a page (9)
+        t2.apply_key(self_state, t2.K_NPAGE, view_h=10, total=50)
+        self.assertIsNone(self_state.view_top)  # back at the bottom: re-pinned
         t2.apply_key(self_state, t2.K_HOME)
-        self.assertGreater(self_state.scroll_up, 50)
+        self.assertEqual(self_state.view_top, 0)
         t2.apply_key(self_state, t2.K_END)
-        self.assertEqual(self_state.scroll_up, 0)
+        self.assertIsNone(self_state.view_top)
+
+    def test_scroll_up_anchors_at_bottom(self):
+        state = self._state()
+        fill(state, 30)
+        t2.apply_key(state, t2.K_UP, view_h=8, total=30)
+        self.assertEqual(state.view_top, 19)  # bottom (22) minus 3
 
     def test_wheel_events(self):
         state = self._state()
         fill(state, 50)
-        t2.apply_key(state, ("wheel", 3))
-        self.assertEqual(state.scroll_up, 3)
-        t2.apply_key(state, ("wheel", -10))
-        self.assertEqual(state.scroll_up, 0)
+        t2.apply_key(state, ("wheel", 3), total=50)
+        self.assertEqual(state.view_top, 23)  # bottom (26) minus 3
+        t2.apply_key(state, ("wheel", -10), total=50)
+        self.assertIsNone(state.view_top)  # past the bottom: re-pinned
 
 
 class TestBlocksFromHistory(unittest.TestCase):
@@ -266,14 +290,88 @@ class TestApplyEvent(unittest.TestCase):
         self.assertIn("tokens: 400/1600 (25%)", status_line)
 
 
+class TestInputDecoder(unittest.TestCase):
+    def test_plain_keys(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"hi", 1.0), [("key", ord("h")), ("key", ord("i"))])
+
+    def test_paste_is_literal(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"\x1b[200~line1\r\nline2\x1b[201~", 1.0), [("paste", "line1\nline2")])
+
+    def test_paste_ignores_enter_and_ctrl_c(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"\x1b[200~a\r\x03b\x1b[201~", 1.0), [("paste", "a\nb")])
+
+    def test_keys_around_paste(self):
+        d = t2._InputDecoder()
+        self.assertEqual(
+            d.feed(b"x\x1b[200~p\rq\x1b[201~y", 1.0),
+            [("key", ord("x")), ("paste", "p\nq"), ("key", ord("y"))],
+        )
+
+    def test_paste_split_across_feeds(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"\x1b[200~li", 1.0), [])
+        self.assertEqual(d.feed(b"ne1\nlin", 1.5), [])
+        self.assertEqual(d.feed(b"e2\x1b[201~", 2.0), [("paste", "line1\nline2")])
+
+    def test_bare_esc_grace_still_works(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"\x1b", 1.0), [])
+        self.assertEqual(d.feed(b"", 1.1), [("key", t2.K_ESC)])
+
+    def test_paste_containing_esc_byte(self):
+        d = t2._InputDecoder()
+        self.assertEqual(d.feed(b"\x1b[200~a\x1bb\x1b[201~", 1.0), [("paste", "ab")])
+
+
+class TestMultilineInput(unittest.TestCase):
+    def test_multiline_input_renders_block(self):
+        state = t2.UIState()
+        state.input_buf = "line one\nline two"
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertEqual(len(rows), 10)
+        self.assertIn("status:", "".join(s[0] for s in rows[7]))
+        self.assertEqual(rows[8][0][0], "> ")
+        self.assertEqual(rows[8][1][0], "line one")
+        self.assertEqual(rows[9][0][0], "  ")
+        self.assertEqual(rows[9][1][0], "line two")
+
+    def test_multiline_cursor_pos(self):
+        state = t2.UIState()
+        state.input_buf = "ab\ncd"
+        state.cursor = 0
+        self.assertEqual(t2._cursor_pos(state, 10), (8, 2))
+        state.cursor = 3  # start of line 2
+        self.assertEqual(t2._cursor_pos(state, 10), (9, 2))
+        state.cursor = 5  # end of "cd"
+        self.assertEqual(t2._cursor_pos(state, 10), (9, 4))
+
+    def test_insert_text(self):
+        state = t2.UIState()
+        state.input_buf = "abc"
+        state.cursor = 1
+        t2._insert_text(state, "XY")
+        self.assertEqual(state.input_buf, "aXYbc")
+        self.assertEqual(state.cursor, 3)
+
+    def test_multiline_submit_keeps_newlines(self):
+        state = t2.UIState()
+        t2._insert_text(state, "line1\nline2")
+        action, payload = t2.apply_key(state, t2.K_ENTER)
+        self.assertEqual(action, "submit")
+        self.assertEqual(payload, "line1\nline2")
+
+
 class TestSubmitMessage(unittest.TestCase):
     def test_prompt_recorded_and_turn_started(self):
         state = t2.UIState()
-        state.scroll_up = 5
+        state.view_top = 5  # detached (reading old content)
         t2.apply_token(state, "assistant", "old answer", True)
         t2.submit_message(state, "my prompt")
         self.assertTrue(state.busy)
-        self.assertEqual(state.scroll_up, 0)
+        self.assertIsNone(state.view_top)  # re-pinned to follow the new turn
         block = state.blocks[-1]
         self.assertEqual((block.role, block.prefix, block.raw, block.style), ("user", "You: ", "my prompt", t2.STY_YOU))
         # the previous active block was finalized into scrollback first

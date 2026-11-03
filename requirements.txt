@@ -15,8 +15,6 @@ jaraco.functools==4.4.0
 jaraco.logging==3.4.0
 jaraco.stream==3.0.4
 jaraco.text==4.2.0
-markdown-it-py==4.0.0
-mdurl==0.1.2
 more-itertools==10.8.0
 multidict==6.7.1
 propcache==0.4.1
@@ -32,4 +30,3 @@ typer==0.24.1
 typer-slim==0.24.0
 yarl==1.23.0
 huggingface_hub==1.7.2
-textual==8.2.0

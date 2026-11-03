@@ -1,268 +1,683 @@
+"""Bare-bones curses terminal client.
+
+Full-screen TUI with O(visible-lines) render cost: a scrollback viewport, a
+pinned status bar and a pinned prompt line. No widgets, no markdown engine -
+every message is plain ANSI-styled text, so hundreds of messages cost the same
+as dozens.
+
+Layout (H x W):
+    rows 0 .. H-3   scrollback viewport (window into all message lines)
+    row   H-2       status bar (bold green): spinner/state + token usage
+    row   H-1       prompt line: "> " + input + cursor
+
+Keys: Enter submit, Backspace/Left/Right edit, PgUp/PgDn/Home/End/wheel scroll,
+Ctrl+C interrupt a running turn (clears input when idle), Ctrl+Q quit.
+"""
+
+import asyncio
+import curses
+import fcntl
 import json
 import logging
+import os
+import pathlib
+import struct
+import sys
+import termios
+import textwrap
 import time
 import uuid
 
-from rich.markup import escape
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.widgets import Collapsible, Input, Markdown, Static
-
-from bus import Bus, History, Interrupt, Token, TurnDone, UsageReport, UserMessage
+from bus import Bus, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
 
 logger = logging.getLogger()
 
-MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+USER_ID = "0"
+
+# key codes (curses KEY_* values; enter/backspace are raw bytes)
+K_ENTER = 10
+K_BACKSPACE = 127
+K_ESC = 27
+K_CTRL_C = 3
+K_CTRL_Q = 17
+K_UP = 259
+K_DOWN = 260
+K_LEFT = 261
+K_RIGHT = 262
+K_HOME = 270
+K_END = 271
+K_PPAGE = 339
+K_NPAGE = 338
+
+SPINNER = "🌑🌒🌓🌔🌕🌖🌗🌘"
+
+# style ids (mapped to curses attrs in _curses_setup; pure layer stays curses-free)
+STY_PLAIN = 0
+STY_DIM = 1
+STY_YOU = 2
+STY_TOOL = 3
+STY_INFO = 4
+STY_STATUS = 5
+
+_ROLE_STYLE = {
+    "thinking": STY_DIM,
+    "assistant": STY_PLAIN,
+    "tool": STY_TOOL,
+    "info": STY_INFO,
+    "error": STY_INFO,
+}
+_ROLE_PREFIX = {
+    "thinking": "(thinking) ",
+    "assistant": "",
+    "user": "You: ",
+}
 
 
-class ChatApp(App):
-    STATE_STREAMING = "streaming"
-    STATE_IDLE = "idle"
-    # Overrides Textual's default ctrl+c -> help_quit system binding, which would
-    # otherwise shadow the interrupt (key handlers lose to bindings on bubbling).
-    BINDINGS = [Binding("ctrl+c", "interrupt_turn", show=False)]
-    CSS = """
-    #stats_bar {
-        border: solid $accent;
-        background: $surface;
-        padding: 0 1;
-        color: $text-muted;
-    }
-    """
+class Block:
+    """One rendered message: role-styled raw text wrapped at render time."""
 
-    def __init__(self, bus: Bus, context_size: int = 16384) -> None:
-        super().__init__()
-        self.bus = bus
-        self.context_size = context_size or 16384
+    __slots__ = ("role", "prefix", "raw", "style")
 
-    async def on_mount(self):
-        # This ensures the input is ready for typing immediately
-        self.query_one(Input).focus()
-        container = self.query_one("#chat_container")
-        container.anchor()
-        await container.mount(Static("[bold cyan]↩  C H A T[/]"))
-        await container.mount(Static("[grey]Local AI Assistant[/]"))
+    def __init__(self, role: str, prefix: str, raw: str, style: int) -> None:
+        self.role = role
+        self.prefix = prefix
+        self.raw = raw
+        self.style = style
 
-        self.state = ChatApp.STATE_IDLE
+
+class UIState:
+    """All UI state; every mutator is a pure-ish function testable headless."""
+
+    def __init__(self, context_size: int = 0) -> None:
+        self.blocks: list[Block] = []
+        self.active: Block | None = None
+        self.cache: dict[int, tuple[int, list]] = {}  # id(block) -> (width, lines)
+        # Absolute index of the viewport's top line; None means pinned to the
+        # bottom (auto-follows new content). While set, streaming does not move
+        # the view - new lines accumulate below it.
+        self.view_top: int | None = None
+        self.input_buf = ""
+        self.cursor = 0
+        self.status = "ready"
         self.busy = False
-        self.done = False
-        self._frame_idx = 0
-        self._last_flush = 0.0
-        self._pending: set[str] = set()
-        self._stats_text = f"tokens: - / {self.context_size}"
+        self.tokens = 0
+        self.context_size = context_size
+        self.frame = 0
 
-        self.set_interval(0.2, self.tick_spinner)
-        self.run_worker(write_output(self, self.bus))
 
-    def compose(self) -> ComposeResult:
-        # Use a scrollable container for the chat history
-        yield VerticalScroll(id="chat_container")
-        yield Static(f"tokens: - / {self.context_size}", id="stats_bar")
-        yield Input(placeholder="Type here...")
+def wrap_text(text: str, width: int) -> list[str]:
+    """Wrap text into lines of at most `width` cells (empty paragraphs kept)."""
+    if not text:
+        return [""]
+    out: list[str] = []
+    for para in text.split("\n"):
+        out.extend(textwrap.wrap(para, max(1, width)) or [""])
+    return out
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if not event.value.strip():
-            return
-        container = self.query_one("#chat_container")
-        await container.mount(Static(f"[bold cyan]You:[/][white] {escape(event.value)}[/]"))
-        container.scroll_end(animate=False)
-        msg_id = uuid.uuid4().hex[:8]
-        self.bus.post(UserMessage("0", event.value, msg_id))
-        self._pending.add(msg_id)
-        self.busy = True
-        self.done = False
-        self._frame_idx = 0
-        self.render_bar()
-        event.input.value = ""
 
-    async def debug(self, text):
-        container = self.query_one("#chat_container")
-        await container.mount(Static(text))
-        container.scroll_end(animate=False)
-
-    async def create_container(self, markdown=False):
-        container = self.query_one("#chat_container")
-        widget = Markdown("") if markdown else Static("")
-        await container.mount(widget)
-        self.current_response = widget
-
-    def action_interrupt_turn(self) -> None:
-        self.bus.post(Interrupt("0"))
-
-    def render_bar(self) -> None:
-        if self.busy:
-            frame = MOON_PHASES[self._frame_idx % len(MOON_PHASES)]
-            self._frame_idx += 1
-            prefix = f"{frame} "
-        elif self.done:
-            prefix = "✅ "
+def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[str, int]]]:
+    """Wrapped, styled lines for a block; finalized blocks are cached per
+    (block, width). The active block is never cached: its raw text grows on
+    every token while the object identity stays the same."""
+    key = id(block)
+    if block is not state.active:
+        cached = state.cache.get(key)
+        if cached is not None and cached[0] == width:
+            return cached[1]
+    lines: list[list[tuple[str, int]]] = []
+    wrapped = wrap_text(block.raw, max(1, width - 2))
+    for i, ln in enumerate(wrapped):
+        if i == 0 and block.prefix:
+            lines.append([(block.prefix, block.style), (ln, block.style)])
+        elif i > 0:
+            lines.append([("  " + ln, block.style)])
         else:
-            prefix = "  "
-        self.query_one("#stats_bar").update(f"{prefix}{self._stats_text}")
-
-    def tick_spinner(self) -> None:
-        if self.busy:
-            self.render_bar()
-
-    async def turn_done(self, msg_id: str) -> None:
-        self._pending.discard(msg_id)
-        if self._pending:
-            return
-        self.busy = False
-        self.done = True
-        self.render_bar()
-
-    async def update_stats(self, usage: dict) -> None:
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        total = usage.get("total_tokens", prompt_tokens + completion_tokens)
-        ctx = self.context_size or 16384
-        pct = (total / ctx * 100) if ctx else 0.0
-        self._stats_text = (
-            f"tokens: {total} / {ctx} ({pct:.1f}%) | prompt: {prompt_tokens} completion: {completion_tokens}"
-        )
-        self.render_bar()
-
-    async def on_llm_text(self, user_id, role, token, chunk):
-        """Now you can append tokens without a newline!"""
-        if self.state == ChatApp.STATE_IDLE:
-            if chunk:
-                self.state = ChatApp.STATE_STREAMING
-                self.current_text = ""
-                if role == "thinking":
-                    inner = Static("")
-                    await self.query_one("#chat_container").mount(Collapsible(inner, title="💭 Thinking"))
-                    self.current_response = inner
-                else:
-                    await self.create_container(markdown=True)
-            else:
-                await self.create_container(markdown=False)
-
-        if not chunk and token == "":
-            # Per-LLM-call end marker (fires between tool calls too) - flush any pending
-            # buffered text, then reset streaming state only. The checkmark is set by the
-            # turn event, which fires once per user turn.
-            if getattr(self, "_thinking_active", False):
-                self._flush_thinking()
-            self.state = ChatApp.STATE_IDLE
-            return
-
-        if role != "thinking" and chunk and getattr(self, "_thinking_active", False):
-            self.current_response.update("[dim italic]" + escape(self.current_text) + "[/]")
-            await self.create_container(markdown=True)
-            self.current_text = ""
-            self._thinking_active = False
-
-        if role == "thinking" and chunk:
-            self._thinking_active = True
-            self._last_flush = 0.0  # first token renders immediately
-
-        if self.state == ChatApp.STATE_STREAMING:
-            self.current_text += token  # raw; markup is applied at flush time
-            if self._thinking_active:
-                # Static + rich markup: escape the full accumulated text (style tags can
-                # span token boundaries, so per-token escaping leaks them), throttled to
-                # ~30 updates/sec since each update re-parses and re-lays-out everything.
-                if time.monotonic() - self._last_flush >= 0.033:
-                    self._flush_thinking()
-            else:
-                self.current_response.update(self.current_text)  # Markdown widget: raw text, no markup parsing
-        else:
-            self.current_response.update(f"[bold magenta]{role} 🤖:[/][white] {escape(token)}[/]")
-
-        container = self.query_one("#chat_container")
-        # Follow the stream only if the user is at the bottom (half-line
-        # epsilon absorbs float noise from Textual's own pinning);
-        # scroll_end also re-asserts the anchor, so follow survives any
-        # interaction that released it (wheel, scrollbar, widget focus).
-        if container.scroll_y + 0.5 >= container.max_scroll_y:
-            container.scroll_end(animate=False)
+            lines.append([(ln, block.style)])
+    if block is not state.active:
+        state.cache[key] = (width, lines)
+    return lines
 
 
-    def _flush_thinking(self) -> None:
-        """Render the accumulated raw thinking text; escape covers the whole string."""
-        self.current_response.update("[dim italic]" + escape(self.current_text))
-        self._last_flush = time.monotonic()
+def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str, int]]]:
+    """Build the full screen as rows of (text, style) segments. Pure."""
+    input_lines = state.input_buf.split("\n") if state.input_buf else [""]
+    view_h = max(1, height - 2 - (len(input_lines) - 1))
+    all_lines: list[list[tuple[str, int]]] = []
+    for block in state.blocks:
+        all_lines.extend(_block_lines(state, block, width))
+    if state.active is not None:
+        all_lines.extend(_block_lines(state, state.active, width))
 
-    async def render_history(self, messages: list[dict]) -> None:
-        """Mount saved conversation history using the same widgets as live rendering.
+    total = len(all_lines)
+    bottom = max(0, total - view_h)
+    top = bottom if state.view_top is None else min(state.view_top, bottom)
 
-        Mounts are queued without awaiting so they all land before the next frame
-        is drawn - the window appears fully populated in a single draw."""
-        container = self.query_one("#chat_container")
-        mounts = []
-        i = 0
-        while i < len(messages):
-            m = messages[i]
-            role = m.get("role")
+    rows: list[list[tuple[str, int]]] = []
+    for i in range(view_h):
+        idx = top + i
+        rows.append(all_lines[idx] if idx < total else [("", STY_PLAIN)])
 
+    label = f"{SPINNER[state.frame % len(SPINNER)]} thinking" if state.busy else state.status
+    if state.context_size:
+        pct = int(state.tokens * 100 / state.context_size)
+        tok = f" tokens: {state.tokens}/{state.context_size} ({pct}%)"
+    else:
+        tok = ""
+    rows.append([(f"status: {label}{tok}", STY_STATUS)])
+
+    # Input block: one row per line, "> " on the first, indented after; the
+    # block's last row is the screen bottom. The viewport shrinks to fit.
+    for i, ln in enumerate(input_lines):
+        prefix = ("> ", STY_YOU) if i == 0 else ("  ", STY_PLAIN)
+        rows.append([prefix, (ln, STY_PLAIN)])
+    if not state.input_buf:
+        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit", STY_DIM))
+    return rows
+
+
+def _finalize_active(state: UIState) -> None:
+    if state.active is not None and state.active.raw.strip():
+        state.blocks.append(state.active)
+    state.active = None
+
+
+def apply_token(state: UIState, role: str, text: str, chunk: bool) -> None:
+    """Feed one outbound Token event into the state."""
+    if chunk:
+        if state.active is None or state.active.role != role:
+            _finalize_active(state)
+            style = _ROLE_STYLE.get(role, STY_PLAIN)
+            prefix = _ROLE_PREFIX.get(role, "")
+            state.active = Block(role, prefix, "", style)
+        state.active.raw += text
+    elif text:
+        # one-shot status line (tool call, info, error)
+        _finalize_active(state)
+        state.blocks.append(Block(role, "", text, _ROLE_STYLE.get(role, STY_INFO)))
+    else:
+        # per-LLM-call end marker
+        _finalize_active(state)
+
+
+def submit_message(state: UIState, text: str) -> None:
+    """Record the user's prompt in the scrollback (matching how history
+    renders it) and start the turn."""
+    _finalize_active(state)
+    state.blocks.append(Block("user", "You: ", text, STY_YOU))
+    state.view_top = None  # follow the new content
+    state.busy = True
+
+
+def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[str, str]:
+    """Apply one key event. Returns (action, payload); action is one of
+    "", "submit" (payload = text), "interrupt", "quit"."""
+    if isinstance(key, tuple):  # ("wheel", delta): positive = older content
+        _scroll(state, key[1], total, view_h)
+        return "", ""
+    if key == K_CTRL_Q:
+        return "quit", ""
+    if key == K_CTRL_C:
+        if state.busy:
+            return "interrupt", ""
+        state.input_buf = ""
+        state.cursor = 0
+        return "", ""
+    if key in (K_ENTER, 13):
+        text = state.input_buf.strip()
+        state.input_buf = ""
+        state.cursor = 0
+        if not text:
+            return "", ""
+        return "submit", text
+    if key == K_ESC:
+        state.input_buf = ""
+        state.cursor = 0
+        return "", ""
+    if key in (K_BACKSPACE, 8):
+        if state.cursor > 0:
+            state.input_buf = state.input_buf[: state.cursor - 1] + state.input_buf[state.cursor :]
+            state.cursor -= 1
+        return "", ""
+    if key == K_UP:
+        _scroll(state, 3, total, view_h)
+        return "", ""
+    if key == K_DOWN:
+        _scroll(state, -3, total, view_h)
+        return "", ""
+    if key == K_LEFT:
+        state.cursor = max(0, state.cursor - 1)
+        return "", ""
+    if key == K_RIGHT:
+        state.cursor = min(len(state.input_buf), state.cursor + 1)
+        return "", ""
+    if key == K_PPAGE:
+        _scroll(state, view_h - 1, total, view_h)
+        return "", ""
+    if key == K_NPAGE:
+        _scroll(state, -(view_h - 1), total, view_h)
+        return "", ""
+    if key == K_HOME:
+        state.view_top = 0
+        return "", ""
+    if key == K_END:
+        state.view_top = None
+        return "", ""
+    if 32 <= key < 127:
+        state.input_buf = state.input_buf[: state.cursor] + chr(key) + state.input_buf[state.cursor :]
+        state.cursor += 1
+        return "", ""
+    return "", ""
+
+
+def count_lines(state: UIState, width: int) -> int:
+    """Total wrapped content lines (viewport area only, pinned bars excluded)."""
+    n = sum(len(_block_lines(state, b, width)) for b in state.blocks)
+    if state.active is not None:
+        n += len(_block_lines(state, state.active, width))
+    return n
+
+
+def _scroll(state: UIState, delta: int, total: int, view_h: int) -> None:
+    """Scroll the viewport; positive delta moves toward older content.
+    Absolute anchor: while detached, streaming does not move the view;
+    reaching the bottom re-pins (auto-follow)."""
+    bottom = max(0, total - view_h)
+    if state.view_top is None:
+        state.view_top = bottom  # first scroll up anchors at the current bottom
+    state.view_top = max(0, min(state.view_top - delta, bottom))
+    if state.view_top == bottom:
+        state.view_top = None
+
+
+def blocks_from_history(messages: list[dict]) -> list[Block]:
+    """Convert saved conversation messages into renderable blocks."""
+    out: list[Block] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":
             if m.get("compaction_marker"):
-                # Render marker + summary pair as one system-event entry
-                summary = None
-                if i + 1 < len(messages) and messages[i + 1].get("compaction_summary"):
-                    summary = messages[i + 1].get("content")
-                    i += 1
-                mounts.append(container.mount(Static("[bold magenta]compaction \U0001F916:[/][white] context compacted[/]")))
-                if summary:
-                    # Content passed at construction (post-mount update would be lost before mount)
-                    mounts.append(container.mount(Collapsible(Markdown(summary), title="\U0001F4DD Summary")))
-                i += 1
-                continue
-
-            if role == "user":
-                text = m.get("content") or ""
-                if text.strip():
-                    mounts.append(container.mount(Static(f"[bold cyan]You:[/][white] {escape(text)}[/]")))
-            elif role == "assistant":
-                reasoning = m.get("reasoning_content")
-                if reasoning:
-                    mounts.append(container.mount(Collapsible(Static(f"[dim italic]{escape(reasoning)}[/]"), title="\U0001F4AD Thinking")))
-                content = m.get("content")
+                out.append(Block("info", "", "[compaction] context summarized", STY_INFO))
+            else:
+                content = m.get("content") or ""
                 if content:
-                    mounts.append(container.mount(Markdown(content)))
-                for tc in m.get("tool_calls") or []:
-                    fn = tc.get("function", {})
-                    name = fn.get("name", "")
-                    args = fn.get("arguments", "")
-                    try:
-                        parsed = json.loads(args) if args else {}
-                        args_short = ", ".join(f"{k}={v!r}" for k, v in parsed.items())
-                    except (ValueError, AttributeError):
-                        args_short = str(args)
-                    if len(args_short) > 200:
-                        args_short = args_short[:200] + "..."
-                    # Same line format as live tool status events
-                    mounts.append(container.mount(Static(f"[bold magenta]tool \U0001F916:[/][white] {escape(name + '(' + args_short + ')')}[/]")))
-            # tool results are not rendered (parity with live mode)
+                    out.append(Block("user", "You: ", content, STY_YOU))
+        elif role == "assistant":
+            reasoning = m.get("reasoning_content")
+            if reasoning:
+                out.append(Block("thinking", "(thinking) ", reasoning, STY_DIM))
+            content = m.get("content")
+            if m.get("compaction_summary"):
+                if content:
+                    out.append(Block("info", "(summary) ", content, STY_INFO))
+            elif content:
+                out.append(Block("assistant", "", content, STY_PLAIN))
+            for tc in m.get("tool_calls") or []:
+                try:
+                    fn = tc["function"]
+                    args = json.loads(fn.get("arguments") or "{}")
+                    args_short = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                except (ValueError, AttributeError, KeyError, TypeError):
+                    args_short = str(fn.get("arguments", "")) if isinstance(fn, dict) else str(fn)
+                if len(args_short) > 200:
+                    args_short = args_short[:200] + "..."
+                name = fn.get("name", "?") if isinstance(fn, dict) else "?"
+                out.append(Block("tool", "", f"{name}({args_short})", STY_TOOL))
+        # tool results are not rendered (parity with the Textual client)
+    return out
+
+
+def apply_event(state: UIState, event) -> None:
+    """Feed one outbound bus event into the state."""
+    match event:
+        case Token(_, role, text, chunk):
+            apply_token(state, role, text, chunk)
+        case TurnDone(_):
+            _finalize_active(state)
+            state.busy = False
+            state.status = "ready"
+        case UsageReport(_, data):
+            state.tokens = int(data.get("prompt_tokens", 0)) + int(data.get("completion_tokens", 0))
+        case History(messages):
+            for block in blocks_from_history(messages):
+                state.blocks.append(block)
+
+
+# ---------------------------------------------------------------------------
+# curses I/O layer
+# ---------------------------------------------------------------------------
+
+_STYLE_ATTRS: dict[int, int] = {}
+
+
+def _diagnose_terminal() -> None:
+    """Log exactly which terminal/terminfo we are running under (for debugging)."""
+    env_keys = ("TERM", "TERM_PROGRAM", "COLORTERM", "VTE_VERSION", "KONSOLE_VERSION", "KITTY_WINDOW_ID", "WEZTERM_PANE", "ALACRITTY_LOG")
+    env = {k: os.environ[k] for k in env_keys if os.environ.get(k)}
+    term = os.environ.get("TERM", "")
+    first = term[:1]
+    db_dirs = [
+        pathlib.Path.home() / ".terminfo",
+        pathlib.Path("/usr/share/terminfo"),
+        pathlib.Path("/lib/terminfo"),
+        pathlib.Path("/usr/lib/terminfo"),
+        pathlib.Path("/usr/lib64/terminfo"),
+    ]
+    terminfo_file = next((d / first / term for d in db_dirs if (d / first / term).is_file()), None)
+    logger.info("terminal startup: %s", env or "no terminal env vars set")
+    logger.info("terminal startup: TERM=%r terminfo file: %s", term, str(terminfo_file) if terminfo_file else "NOT FOUND in plain-text db (may be compiled .db only)")
+
+
+def _curses_setup() -> "curses._CursesWindow":
+    stdscr = curses.initscr()
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_GREEN, -1)
+        _STYLE_ATTRS.update(
+            {
+                STY_PLAIN: 0,
+                # faded text (thinking, hints)
+                STY_DIM: curses.A_DIM,
+                STY_YOU: curses.A_BOLD | curses.color_pair(1),
+                STY_TOOL: curses.color_pair(2),
+                STY_INFO: curses.A_BOLD | curses.color_pair(3),
+                # bold green: UI chrome, distinct from the cyan "You:" text.
+                STY_STATUS: curses.A_BOLD | curses.color_pair(4),
+            }
+        )
+    except curses.error:
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD})
+    # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
+    # our decoder instead of raising SIGINT. Input is read from stdin directly;
+    # getch is never used.
+    curses.raw()
+    curses.noecho()
+    # NOTE: mouse reporting is deliberately NOT enabled. This system's ncurses
+    # enables SGR mouse mode but fails to parse the sequences; _decode_input
+    # swallows any mouse sequences that do arrive. Scroll with up/down,
+    # PgUp/PgDn, Home/End instead.
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    return stdscr
+
+
+def _decode_esc_body(buf: bytes):
+    """Map a post-ESC byte sequence to a key constant; None = swallow (mouse
+    garbage or unknown protocol). Empty buffer = bare ESC."""
+    if not buf:
+        return K_ESC
+    mapping = {
+        b"[A": K_UP,
+        b"[B": K_DOWN,
+        b"[C": K_RIGHT,
+        b"[D": K_LEFT,
+        b"[5~": K_PPAGE,
+        b"[6~": K_NPAGE,
+        b"[H": K_HOME,
+        b"[F": K_END,
+    }
+    return mapping.get(buf)
+
+
+def _decode_input(buf: bytes) -> tuple[list, bytes]:
+    """Split raw stdin bytes into complete key events plus any trailing
+    partial escape sequence (held back until more bytes arrive or the grace
+    period in run() expires). Mouse sequences are swallowed."""
+    keys: list = []
+    i, n = 0, len(buf)
+    while i < n:
+        b = buf[i]
+        if b == 0x1B:  # ESC
+            j = i + 1
+            if j >= n or buf[j] not in (0x5B, 0x4D):
+                break  # hold back; the grace period resolves a bare ESC
+            if buf[j] == 0x5B:  # CSI: ESC [ params final(0x40-0x7E)
+                k = j + 1
+                while k < n and not (0x40 <= buf[k] <= 0x7E):
+                    k += 1
+                if k >= n:
+                    break  # incomplete CSI, wait for more bytes
+                key = _decode_esc_body(buf[i + 1:k + 1])
+                if key is not None:
+                    keys.append(key)
+                i = k + 1
+                continue
+            if j + 3 >= n:  # X10 mouse: ESC M + 3 bytes, incomplete
+                break
+            i = j + 4  # swallow the mouse sequence
+            continue
+        if b in (0x0D, 0x0A):
+            keys.append(K_ENTER)
             i += 1
-        for mount in mounts:
-            await mount
-        container.scroll_end(animate=False)
+        elif b in (0x7F, 0x08):
+            keys.append(K_BACKSPACE)
+            i += 1
+        elif b == K_CTRL_C:
+            keys.append(K_CTRL_C)
+            i += 1
+        elif b == K_CTRL_Q:
+            keys.append(K_CTRL_Q)
+            i += 1
+        elif 0x20 <= b < 0x7F:
+            keys.append(b)
+            i += 1
+        else:
+            i += 1  # swallow other control bytes
+    return keys, buf[i:]
 
 
-async def write_output(app: ChatApp, bus: Bus):
-    """Consume outbound events until the task is cancelled."""
-    while True:
-        event = await bus.outbound.get()
-        try:
-            match event:
-                case Token(user_id, role, text, chunk):
-                    await app.on_llm_text(user_id, role, text, chunk)
-                case UsageReport(_, usage):
-                    await app.update_stats(usage)
-                case TurnDone(msg_id):
-                    await app.turn_done(msg_id)
-                case History(messages):
-                    await app.render_history(messages)
-        except Exception:
-            logger.exception("Failed to render outbound event: %s", event)
+class _InputDecoder:
+    """Sits between raw stdin bytes and key events. Understands bracketed
+    paste (ESC[200~ ... ESC[201~): pasted text is delivered as a single
+    ("paste", text) event instead of being interpreted as keys, so an Enter
+    inside a paste does not submit. Terminals without the feature simply
+    never send the markers and pastes degrade to the old behavior."""
+
+    def __init__(self) -> None:
+        self.buf = b""  # undecoded bytes (partial sequences / mid-paste)
+        self.in_paste = False
+        self.paste_buf = b""
+        self.pend_start = 0.0
+
+    def feed(self, data: bytes, now: float) -> list[tuple[str, object]]:
+        """Feed raw bytes; returns ("key", int) and ("paste", str) events."""
+        events: list[tuple[str, object]] = []
+        self.buf += data
+        while True:
+            if self.in_paste:
+                end = self.buf.find(b"\x1b[201~")
+                if end == -1:
+                    break  # wait for the closing marker
+                self.paste_buf += self.buf[:end]
+                self.buf = self.buf[end + 6:]
+                self.in_paste = False
+                events.append(("paste", _decode_text(self.paste_buf)))
+                self.paste_buf = b""
+                continue
+            i = self.buf.find(b"\x1b[200~")
+            if i != -1:
+                head, rest = self.buf[:i], self.buf[i + 6:]
+                keys, rem = self._decode_keys(head, now)
+                events.extend(("key", k) for k in keys)
+                self.buf = rem + rest  # hold any partial tail; keep the paste payload
+                self.in_paste = True
+                continue
+            keys, rem = self._decode_keys(self.buf, now)
+            events.extend(("key", k) for k in keys)
+            self.buf = rem
+            break
+        return events
+
+    def _decode_keys(self, data: bytes, now: float) -> tuple[list[int], bytes]:
+        keys, rem = _decode_input(data)
+        if rem:
+            if self.pend_start == 0.0:
+                self.pend_start = now
+            elif now - self.pend_start > 0.03 or len(rem) >= 16:
+                # Grace period expired: a bare ESC (or a truncated sequence
+                # that will never complete).
+                if rem == b"\x1b":
+                    keys.append(K_ESC)
+                rem = b""
+        else:
+            self.pend_start = 0.0
+        return keys, rem
 
 
-def stop() -> None:
-    logger.info("Stopping terminal...")
+def _decode_text(data: bytes) -> str:
+    """Decode pasted bytes; all line endings become \\n, other control
+    characters are dropped (a paste is literal text, not key input)."""
+    text = data.decode("utf-8", "replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in text if ch == "\n" or ord(ch) >= 32)
+
+
+def _insert_text(state: UIState, text: str) -> None:
+    """Insert literal text at the cursor (paste / multi-char input)."""
+    state.input_buf = state.input_buf[: state.cursor] + text + state.input_buf[state.cursor :]
+    state.cursor += len(text)
+
+
+def _cursor_pos(state: UIState, height: int) -> tuple[int, int]:
+    """(row, col) of the cursor for the current input; the prompt block
+    occupies the bottom len(input_lines) rows, "> " on the first line."""
+    lines = state.input_buf.split("\n") if state.input_buf else [""]
+    li, start = 0, 0
+    for i, ln in enumerate(lines):
+        if state.cursor <= start + len(ln):
+            li = i
+            break
+        start += len(ln) + 1
+    row = height - len(lines) + li
+    return row, 2 + (state.cursor - start)
+
+
+def _render(stdscr, state: UIState) -> None:
+    try:
+        height, width = stdscr.getmaxyx()
+    except Exception:
+        return
+    rows = render_frame(state, height, width)
+    try:
+        # Clear the virtual screen first so rows that shrink (or blank out)
+        # do not leave stale tails from the previous frame.
+        stdscr.erase()
+    except curses.error:
+        pass
+    for r, row in enumerate(rows[:height]):
+        col = 0
+        for text, style in row:
+            if col >= width - 1 or not text:
+                continue
+            try:
+                stdscr.addnstr(r, col, text, (width - 1) - col, _STYLE_ATTRS.get(style, 0))
+            except curses.error:
+                break
+            col += len(text)
+    try:
+        row, col = _cursor_pos(state, height)
+        stdscr.move(row, min(col, width - 1))
+        stdscr.refresh()
+    except curses.error:
+        pass
 
 
 async def run(bus: Bus, context_size: int = 0) -> None:
-    """Run the Textual UI until cancelled."""
-    await ChatApp(bus, context_size).run_async()
+    """Run the curses UI until cancelled or quit.
+
+    All curses I/O happens on the event-loop thread; key input is read raw
+    from stdin via loop.add_reader (no worker thread), so stdscr is never
+    touched concurrently and ncurses' screen bookkeeping stays consistent."""
+    _diagnose_terminal()
+    stdscr = _curses_setup()
+    try:
+        logger.info("terminal startup: curses window size %sx%s", *stdscr.getmaxyx()[::-1])
+    except Exception:
+        pass
+    state = UIState(context_size=context_size)
+    fd = sys.stdin.fileno()
+    os.set_blocking(fd, False)
+    loop = asyncio.get_running_loop()
+    inbox: dict = {"data": b"", "eof": False}
+
+    def _on_readable() -> None:
+        try:
+            data = os.read(fd, 4096)
+        except (BlockingIOError, OSError):
+            return
+        if data == b"":
+            inbox["eof"] = True
+            return
+        inbox["data"] += data
+
+    loop.add_reader(fd, _on_readable)
+    decoder = _InputDecoder()
+    last_spin = 0.0
+    # Bracketed paste: the terminal wraps pastes in ESC[200~ ... ESC[201~ so
+    # an Enter inside a paste is literal text, not a submit. Terminals
+    # without the feature never send the markers (paste degrades to typing).
+    sys.stdout.write("\x1b[?2004h")
+    sys.stdout.flush()
+    try:
+        while True:
+            await asyncio.sleep(0.033)  # tick + await point for cancellation
+            if inbox["eof"]:
+                break  # stdin closed
+            events = decoder.feed(inbox["data"], time.monotonic())
+            inbox["data"] = b""
+            try:
+                h, w = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8))[:2]
+                if (h, w) != stdscr.getmaxyx():
+                    curses.resizeterm(h, w)
+            except Exception:
+                pass
+            height, width = stdscr.getmaxyx()
+            view_h = max(1, height - 2 - state.input_buf.count("\n"))
+            for kind, value in events:
+                if kind == "paste":
+                    _insert_text(state, str(value))
+                    continue
+                action, payload = apply_key(state, int(value), view_h=view_h, total=count_lines(state, width))
+                if action == "submit":
+                    msg_id = uuid.uuid4().hex[:8]
+                    submit_message(state, payload)
+                    bus.post(UserMessage(USER_ID, payload, msg_id))
+                elif action == "interrupt":
+                    bus.post(Interrupt(USER_ID))
+                elif action == "quit":
+                    bus.post(Shutdown())
+                    return
+            while not bus.outbound.empty():
+                apply_event(state, bus.outbound.get_nowait())
+            if state.busy:
+                now = time.monotonic()
+                if now - last_spin >= 0.2:  # 5fps: a full moon cycle in ~1.6s
+                    state.frame += 1
+                    last_spin = now
+            _render(stdscr, state)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            loop.remove_reader(fd)
+        except Exception:
+            pass
+        try:
+            sys.stdout.write("\x1b[?2004l")  # disable bracketed paste
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            curses.endwin()
+        except Exception:
+            pass
+
+
+def stop() -> None:
+    # No worker threads to stop; run()'s finally block restores the terminal.
+    pass

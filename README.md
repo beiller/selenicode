@@ -121,7 +121,7 @@ A single typed event bus for all client ↔ core communication:
 Three client implementations that follow the same interface pattern:
 
 #### Terminal (`terminal.py`)
-- Single-user interface (local terminal, Textual UI)
+- Single-user interface (local terminal, bare-bones curses TUI: scrollback viewport, pinned status bar and prompt line)
 - No user tracking needed (only one user)
 
 #### Discord (`discord_client.py`)

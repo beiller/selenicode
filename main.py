@@ -703,7 +703,6 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
 
 CLIENTS = {
     "terminal": "clients.terminal",
-    "terminal_v2": "clients.terminal_v2",
     "discord_client": "clients.discord_client",
     "irc_client": "clients.irc_client",
 }
@@ -731,7 +730,7 @@ async def async_main(client_type: str, session_id: str | None = None):
     bus.bind()
     await main_init()
 
-    if resume and client_type in ("terminal", "terminal_v2"):
+    if resume and client_type == "terminal":
         try:
             bus.outbound.put_nowait(History(read_conversation(session_id)))
         except (OSError, ValueError) as e:
