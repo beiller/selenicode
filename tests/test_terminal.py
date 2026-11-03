@@ -108,6 +108,62 @@ class TestRenderFrame(unittest.TestCase):
         self.assertIn("tokens: 500/16384", "".join(seg[0] for seg in rows[-2]))
 
 
+class TestInputWrapping(unittest.TestCase):
+    def _state(self, buf: str, cursor: int) -> t2.UIState:
+        state = t2.UIState()
+        state.input_buf = buf
+        state.cursor = cursor
+        return state
+
+    def test_short_line_single_row(self):
+        state = self._state("hi", 2)
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[-1][1][0], "hi")
+
+    def test_long_line_wraps_across_rows(self):
+        state = self._state("a" * 50, 50)  # chunk_w = 20 - 2 = 18
+        rows = t2.render_frame(state, height=10, width=20)
+        self.assertEqual(len(rows), 10)  # 6 viewport + status + 3 input rows
+        last3 = rows[-3:]
+        self.assertEqual(last3[0][1][0], "a" * 18)
+        self.assertEqual(last3[1][1][0], "a" * 18)
+        self.assertEqual(last3[2][1][0], "a" * 14)
+        self.assertEqual(last3[0][0][0], "> ")  # prompt only on first chunk
+        self.assertEqual(last3[1][0][0], "  ")
+
+    def test_height_helper(self):
+        self.assertEqual(t2._input_block_height([], 80), 0)
+        self.assertEqual(t2._input_block_height([""], 80), 1)
+        self.assertEqual(t2._input_block_height(["a" * 50], 20), 3)
+        self.assertEqual(t2._input_block_height(["ab", "c" * 40], 20), 4)  # 1 + ceil(40/18)
+
+    def test_cursor_first_chunk(self):
+        state = self._state("a" * 50, 5)
+        row, col = t2._cursor_pos(state, height=10, width=20)
+        self.assertEqual((row, col), (7, 7))
+
+    def test_cursor_wraps_onto_second_chunk(self):
+        state = self._state("a" * 50, 19)  # chunk_w 18 -> 2nd chunk, col 1
+        row, col = t2._cursor_pos(state, height=10, width=20)
+        self.assertEqual((row, col), (8, 3))
+
+    def test_cursor_backspace_stays_on_screen(self):
+        state = self._state("a" * 50, 50)
+        for _ in range(49):  # backspace down to one char
+            t2.apply_key(state, 127)  # DEL
+        row, col = t2._cursor_pos(state, height=10, width=20)
+        # the block shrinks from 3 rows to 1 as text is deleted, so the
+        # cursor sits on the bottom row - always on screen
+        self.assertEqual((row, col), (9, 3))
+
+    def test_multiline_with_wrap(self):
+        state = self._state("a" * 50 + "\nbc", 53)
+        rows = t2.render_frame(state, height=10, width=20)
+        self.assertEqual(len(rows), 10)  # 4 viewport + status + 4 input rows
+        self.assertEqual(rows[-1][1][0], "bc")
+
+
 class TestApplyToken(unittest.TestCase):
     def test_streaming_accumulates(self):
         state = t2.UIState()
@@ -342,11 +398,11 @@ class TestMultilineInput(unittest.TestCase):
         state = t2.UIState()
         state.input_buf = "ab\ncd"
         state.cursor = 0
-        self.assertEqual(t2._cursor_pos(state, 10), (8, 2))
+        self.assertEqual(t2._cursor_pos(state, 10, 80), (8, 2))
         state.cursor = 3  # start of line 2
-        self.assertEqual(t2._cursor_pos(state, 10), (9, 2))
+        self.assertEqual(t2._cursor_pos(state, 10, 80), (9, 2))
         state.cursor = 5  # end of "cd"
-        self.assertEqual(t2._cursor_pos(state, 10), (9, 4))
+        self.assertEqual(t2._cursor_pos(state, 10, 80), (9, 4))
 
     def test_insert_text(self):
         state = t2.UIState()

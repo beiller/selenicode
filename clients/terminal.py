@@ -138,10 +138,29 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
     return lines
 
 
+def _input_block_rows(input_lines: list[str], width: int) -> list[list[tuple[str, int]]]:
+    """Rows for the input block; long lines wrap across rows so the cursor
+    never runs off the right edge ("> " on the first line, indented after)."""
+    chunk_w = max(1, width - 2)
+    rows: list[list[tuple[str, int]]] = []
+    for i, ln in enumerate(input_lines):
+        chunks = [ln[j:j + chunk_w] for j in range(0, len(ln), chunk_w)] or [""]
+        for k, chunk in enumerate(chunks):
+            prefix = ("> ", STY_YOU) if (i == 0 and k == 0) else ("  ", STY_PLAIN)
+            rows.append([prefix, (chunk, STY_PLAIN)])
+    return rows
+
+
+def _input_block_height(input_lines: list[str], width: int) -> int:
+    """Rows the input block occupies (long lines wrap)."""
+    chunk_w = max(1, width - 2)
+    return sum(max(1, (len(ln) + chunk_w - 1) // chunk_w) for ln in input_lines)
+
+
 def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str, int]]]:
     """Build the full screen as rows of (text, style) segments. Pure."""
     input_lines = state.input_buf.split("\n") if state.input_buf else [""]
-    view_h = max(1, height - 2 - (len(input_lines) - 1))
+    view_h = max(1, height - 1 - _input_block_height(input_lines, width))
     all_lines: list[list[tuple[str, int]]] = []
     for block in state.blocks:
         all_lines.extend(_block_lines(state, block, width))
@@ -165,11 +184,10 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
         tok = ""
     rows.append([(f"status: {label}{tok}", STY_STATUS)])
 
-    # Input block: one row per line, "> " on the first, indented after; the
-    # block's last row is the screen bottom. The viewport shrinks to fit.
-    for i, ln in enumerate(input_lines):
-        prefix = ("> ", STY_YOU) if i == 0 else ("  ", STY_PLAIN)
-        rows.append([prefix, (ln, STY_PLAIN)])
+    # Input block: one row per line (long lines wrap), "> " on the first,
+    # indented after; the block's last row is the screen bottom. The
+    # viewport shrinks to fit.
+    rows.extend(_input_block_rows(input_lines, width))
     if not state.input_buf:
         rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit", STY_DIM))
     return rows
@@ -543,18 +561,22 @@ def _insert_text(state: UIState, text: str) -> None:
     state.cursor += len(text)
 
 
-def _cursor_pos(state: UIState, height: int) -> tuple[int, int]:
+def _cursor_pos(state: UIState, height: int, width: int) -> tuple[int, int]:
     """(row, col) of the cursor for the current input; the prompt block
-    occupies the bottom len(input_lines) rows, "> " on the first line."""
+    occupies the bottom input-block rows (long lines wrap), "> " on the
+    first line."""
     lines = state.input_buf.split("\n") if state.input_buf else [""]
+    chunk_w = max(1, width - 2)
     li, start = 0, 0
     for i, ln in enumerate(lines):
         if state.cursor <= start + len(ln):
             li = i
             break
         start += len(ln) + 1
-    row = height - len(lines) + li
-    return row, 2 + (state.cursor - start)
+    col_in_line = state.cursor - start
+    rows_before = _input_block_height(lines[:li], width)
+    row = height - _input_block_height(lines, width) + rows_before + col_in_line // chunk_w
+    return row, 2 + col_in_line % chunk_w
 
 
 def _render(stdscr, state: UIState) -> None:
@@ -580,7 +602,7 @@ def _render(stdscr, state: UIState) -> None:
                 break
             col += len(text)
     try:
-        row, col = _cursor_pos(state, height)
+        row, col = _cursor_pos(state, height, width)
         stdscr.move(row, min(col, width - 1))
         stdscr.refresh()
     except curses.error:
@@ -637,7 +659,8 @@ async def run(bus: Bus, context_size: int = 0) -> None:
             except Exception:
                 pass
             height, width = stdscr.getmaxyx()
-            view_h = max(1, height - 2 - state.input_buf.count("\n"))
+            input_lines = state.input_buf.split("\n") if state.input_buf else [""]
+            view_h = max(1, height - 1 - _input_block_height(input_lines, width))
             for kind, value in events:
                 if kind == "paste":
                     _insert_text(state, str(value))
