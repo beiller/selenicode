@@ -164,12 +164,95 @@ class TestInputWrapping(unittest.TestCase):
         self.assertEqual(rows[-1][1][0], "bc")
 
 
+class TestThinkingToggle(unittest.TestCase):
+    def _state(self) -> t2.UIState:
+        return t2.UIState()
+
+    def _screen_text(self, state: t2.UIState) -> str:
+        rows = t2.render_frame(state, height=10, width=80)
+        return "".join(seg[0] for row in rows for seg in row)
+
+    def test_collapsed_placeholder_by_default(self):
+        state = self._state()
+        t2.apply_token(state, "thinking", "a" * 50 + "\n\n" + "b" * 60, True)
+        t2.apply_token(state, "assistant", "hi", False)  # finalizes the thinking block
+        text = self._screen_text(state)
+        self.assertIn("112 chars:", text)  # len of raw incl. newlines
+        self.assertNotIn("b" * 60, text)  # tail beyond the 100-char preview
+
+    def test_placeholder_collapses_whitespace(self):
+        state = self._state()
+        t2.apply_token(state, "thinking", "let   me\nthink", True)
+        t2.apply_token(state, "assistant", "hi", False)
+        text = self._screen_text(state)
+        self.assertIn("14 chars: let me think", text)
+
+    def test_toggle_shows_active_thinking(self):
+        state = self._state()
+        t2.apply_token(state, "thinking", "let me think", True)
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertTrue(state.show_thinking)
+        self.assertIn("let me think", self._screen_text(state))
+
+    def test_toggle_round_trip(self):
+        state = self._state()
+        t2.apply_token(state, "thinking", "x", True)
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertTrue(state.show_thinking)
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertFalse(state.show_thinking)
+
+    def test_count_lines_tracks_visibility(self):
+        state = self._state()
+        t2.apply_token(state, "assistant", "hello world", False)
+        t2.apply_token(state, "thinking", "a" * 100, True)  # 1 collapsed row vs 2 wrapped
+        collapsed_count = t2.count_lines(state, 80)
+        self.assertEqual(collapsed_count, 2)  # assistant + placeholder
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertGreater(t2.count_lines(state, 80), collapsed_count)
+
+    def test_toggle_invalidates_wrap_cache(self):
+        # regression: the wrap cache must not serve a stale collapsed
+        # placeholder after expanding (or full text after collapsing)
+        state = self._state()
+        t2.apply_token(state, "thinking", "y" * 20 + "z" * 300 + "ENDMARKER", True)
+        t2.apply_token(state, "assistant", "hi", False)  # finalizes -> cached collapsed
+        self._screen_text(state)
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertIn("ENDMARKER", self._screen_text(state))  # full text, not the placeholder
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertNotIn("ENDMARKER", self._screen_text(state))  # back to placeholder
+
+    def test_status_hint_shows_collapsed_count(self):
+        state = self._state()
+        t2.apply_token(state, "thinking", "one", True)
+        t2.apply_token(state, "assistant", "hi", False)  # finalizes the thinking block
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertIn("1 thinking collapsed (ctrl+t)", "".join(seg[0] for seg in rows[-2]))
+        t2.apply_key(state, t2.K_CTRL_T)
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertNotIn("thinking collapsed", "".join(seg[0] for seg in rows[-2]))
+
+    def test_history_thinking_block_collapsed(self):
+        state = self._state()
+        state.blocks.append(t2.Block("thinking", "(thinking) ", "secret reasoning", t2.STY_DIM))
+        self.assertEqual(t2.count_lines(state, 80), 1)  # one placeholder row
+        t2.apply_key(state, t2.K_CTRL_T)
+        self.assertIn("secret reasoning", self._screen_text(state))
+
+
 class TestApplyToken(unittest.TestCase):
     def test_streaming_accumulates(self):
         state = t2.UIState()
         t2.apply_token(state, "assistant", "hel", True)
         t2.apply_token(state, "assistant", "lo", True)
         self.assertEqual(state.active.raw, "hello")
+
+    def test_assistant_label(self):
+        state = t2.UIState()
+        t2.apply_token(state, "assistant", "hello", True)
+        rows = t2.render_frame(state, height=10, width=80)
+        self.assertIn("\U0001F916: hello", "".join(seg[0] for row in rows for seg in row))
 
     def test_role_switch_finalizes(self):
         state = t2.UIState()
@@ -293,6 +376,7 @@ class TestBlocksFromHistory(unittest.TestCase):
         self.assertEqual(blocks[0].prefix, "You: ")
         self.assertEqual(blocks[1].style, t2.STY_DIM)
         self.assertIn("run_bash(", blocks[2].raw)
+        self.assertEqual(blocks[3].prefix, "\U0001F916: ")
 
     def test_compaction_marker_and_summary(self):
         msgs = [
@@ -453,6 +537,17 @@ class TestDecodeInput(unittest.TestCase):
         self.assertEqual(t2._decode_input(b"\x08"), ([t2.K_BACKSPACE], b""))
         self.assertEqual(t2._decode_input(b"\x03"), ([t2.K_CTRL_C], b""))
         self.assertEqual(t2._decode_input(b"\x11"), ([t2.K_CTRL_Q], b""))
+        self.assertEqual(t2._decode_input(b"\x14"), ([t2.K_CTRL_T], b""))
+
+    def test_ctrl_t_end_to_end(self):
+        # regression: byte 20 was swallowed by the decoder's catch-all, so
+        # ctrl+t never reached apply_key at all
+        state = t2.UIState()
+        keys, rem = t2._decode_input(b"\x14")
+        self.assertEqual(rem, b"")
+        for k in keys:
+            t2.apply_key(state, k)
+        self.assertTrue(state.show_thinking)
 
     def test_function_keys(self):
         self.assertEqual(t2._decode_input(b"\x1b[A"), ([t2.K_UP], b""))
@@ -486,6 +581,18 @@ class TestDecodeInput(unittest.TestCase):
         keys, rem = t2._decode_input(b"\x1b[A\x1b[5")
         self.assertEqual(keys, [t2.K_UP])
         self.assertEqual(rem, b"\x1b[5")
+
+
+class TestCellLen(unittest.TestCase):
+    def test_ascii(self):
+        self.assertEqual(t2._cell_len("abc"), 3)
+
+    def test_wide_chars_take_two_cells(self):
+        self.assertEqual(t2._cell_len("\U0001F916"), 2)  # robot emoji
+        self.assertEqual(t2._cell_len("\U0001F311"), 2)  # new moon spinner
+
+    def test_mixed(self):
+        self.assertEqual(t2._cell_len("\U0001F916: "), 4)  # emoji(2) + ':' + ' '
 
 
 if __name__ == "__main__":

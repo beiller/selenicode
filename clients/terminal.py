@@ -26,6 +26,7 @@ import sys
 import termios
 import textwrap
 import time
+import unicodedata
 import uuid
 
 from bus import Bus, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
@@ -40,6 +41,7 @@ K_BACKSPACE = 127
 K_ESC = 27
 K_CTRL_C = 3
 K_CTRL_Q = 17
+K_CTRL_T = 20
 K_UP = 259
 K_DOWN = 260
 K_LEFT = 261
@@ -68,7 +70,7 @@ _ROLE_STYLE = {
 }
 _ROLE_PREFIX = {
     "thinking": "(thinking) ",
-    "assistant": "",
+    "assistant": "\U0001F916: ",
     "user": "You: ",
 }
 
@@ -98,6 +100,7 @@ class UIState:
         self.view_top: int | None = None
         self.input_buf = ""
         self.cursor = 0
+        self.show_thinking = False  # ctrl+t toggles; collapsed to a placeholder line by default
         self.status = "ready"
         self.busy = False
         self.tokens = 0
@@ -122,19 +125,29 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
     key = id(block)
     if block is not state.active:
         cached = state.cache.get(key)
-        if cached is not None and cached[0] == width:
+        # show_thinking is part of the key: a cached collapsed placeholder
+        # must not be served after the user expands (or vice versa).
+        if cached is not None and cached[0] == (width, state.show_thinking):
             return cached[1]
     lines: list[list[tuple[str, int]]] = []
-    wrapped = wrap_text(block.raw, max(1, width - 2))
-    for i, ln in enumerate(wrapped):
-        if i == 0 and block.prefix:
-            lines.append([(block.prefix, block.style), (ln, block.style)])
-        elif i > 0:
-            lines.append([("  " + ln, block.style)])
-        else:
-            lines.append([(ln, block.style)])
+    if block.role == "thinking" and not state.show_thinking:
+        # Collapsed placeholder: char count + first 100 chars (whitespace
+        # collapsed) so hidden thinking is visible at a glance.
+        preview = " ".join(block.raw.split())
+        if len(preview) > 100:
+            preview = preview[:100] + "\u2026"
+        lines.append([(f"(thinking) (collapsed) {len(block.raw)} chars: {preview}", block.style)])
+    else:
+        wrapped = wrap_text(block.raw, max(1, width - 2))
+        for i, ln in enumerate(wrapped):
+            if i == 0 and block.prefix:
+                lines.append([(block.prefix, block.style), (ln, block.style)])
+            elif i > 0:
+                lines.append([("  " + ln, block.style)])
+            else:
+                lines.append([(ln, block.style)])
     if block is not state.active:
-        state.cache[key] = (width, lines)
+        state.cache[key] = ((width, state.show_thinking), lines)
     return lines
 
 
@@ -182,14 +195,18 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
         tok = f" tokens: {state.tokens}/{state.context_size} ({pct}%)"
     else:
         tok = ""
-    rows.append([(f"status: {label}{tok}", STY_STATUS)])
+    hidden = sum(1 for b in state.blocks if b.role == "thinking") + (
+        1 if state.active is not None and state.active.role == "thinking" else 0
+    )
+    hid = f" · {hidden} thinking collapsed (ctrl+t)" if hidden and not state.show_thinking else ""
+    rows.append([(f"status: {label}{tok}{hid}", STY_STATUS)])
 
     # Input block: one row per line (long lines wrap), "> " on the first,
     # indented after; the block's last row is the screen bottom. The
     # viewport shrinks to fit.
     rows.extend(_input_block_rows(input_lines, width))
     if not state.input_buf:
-        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit", STY_DIM))
+        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit · ctrl+t show thinking", STY_DIM))
     return rows
 
 
@@ -239,6 +256,9 @@ def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[st
             return "interrupt", ""
         state.input_buf = ""
         state.cursor = 0
+        return "", ""
+    if key == K_CTRL_T:
+        state.show_thinking = not state.show_thinking
         return "", ""
     if key in (K_ENTER, 13):
         text = state.input_buf.strip()
@@ -328,7 +348,7 @@ def blocks_from_history(messages: list[dict]) -> list[Block]:
                 if content:
                     out.append(Block("info", "(summary) ", content, STY_INFO))
             elif content:
-                out.append(Block("assistant", "", content, STY_PLAIN))
+                out.append(Block("assistant", "\U0001F916: ", content, STY_PLAIN))
             for tc in m.get("tool_calls") or []:
                 try:
                     fn = tc["function"]
@@ -481,6 +501,9 @@ def _decode_input(buf: bytes) -> tuple[list, bytes]:
         elif b == K_CTRL_Q:
             keys.append(K_CTRL_Q)
             i += 1
+        elif b == K_CTRL_T:
+            keys.append(K_CTRL_T)
+            i += 1
         elif 0x20 <= b < 0x7F:
             keys.append(b)
             i += 1
@@ -579,6 +602,13 @@ def _cursor_pos(state: UIState, height: int, width: int) -> tuple[int, int]:
     return row, 2 + col_in_line % chunk_w
 
 
+def _cell_len(text: str) -> int:
+    """Display cells occupied by text (wide/fullwidth chars take 2). ncurses
+    advances the cursor by cells, so tracking columns by len() would drift
+    after any emoji and overwrite the following character."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
 def _render(stdscr, state: UIState) -> None:
     try:
         height, width = stdscr.getmaxyx()
@@ -600,7 +630,7 @@ def _render(stdscr, state: UIState) -> None:
                 stdscr.addnstr(r, col, text, (width - 1) - col, _STYLE_ATTRS.get(style, 0))
             except curses.error:
                 break
-            col += len(text)
+            col += _cell_len(text)
     try:
         row, col = _cursor_pos(state, height, width)
         stdscr.move(row, min(col, width - 1))
