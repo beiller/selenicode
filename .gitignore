@@ -12,4 +12,4 @@ models
 aws_cmd.py
 *.tar.gz
 local_skills/*
-agent1.log
+agent1.log*

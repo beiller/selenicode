@@ -44,6 +44,30 @@ class TestExecuteToolCalls(unittest.TestCase):
         self.assertEqual(results[1]["role"], "tool")
         self.assertEqual(results[1]["content"], "async-hi")
 
+    def test_sync_tool_does_not_block_event_loop(self):
+        import time
+
+        events = []
+
+        def slowtool() -> str:
+            events.append(("tool-start", time.monotonic()))
+            time.sleep(0.2)
+            events.append(("tool-end", time.monotonic()))
+            return "slow-done"
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, lambda: events.append(("heartbeat", time.monotonic())))
+            return await main.execute_tool_calls(make_assistant_msg("slowtool", "{}"), {"slowtool": slowtool}, "user1")
+
+        results = asyncio.run(scenario())
+        self.assertEqual(results[1]["content"], "slow-done")
+        times = {name: t for name, t in events}
+        self.assertIn("heartbeat", times)
+        # If the event loop were blocked by the tool, the heartbeat could only
+        # fire after the tool finished.
+        self.assertLess(times["heartbeat"], times["tool-end"])
+
     def test_compact_session_is_registered(self):
         tools, registry = main.build_tools()
         names = [t["function"]["name"] for t in tools]

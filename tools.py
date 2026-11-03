@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Tool implementations for the function-calling server."""
 
+import asyncio
 import difflib
 import json
 import os
 import pathlib
 import re
-import subprocess
 import urllib.request
 
 from main_types import FunctionParameters, Tool, ToolHandler
@@ -58,7 +58,7 @@ def is_safe(cmd: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def run_bash(command: str, allow_unsafe_commands: bool = False) -> str:
+async def run_bash(command: str, allow_unsafe_commands: bool = False) -> str:
     """Run a shell command and return its output.
     - Do not allow unsafe commands unless specifically granted permission.
     - Only if you have got explicit consent from the user, use `allow_unsafe_commands=True`
@@ -76,22 +76,25 @@ def run_bash(command: str, allow_unsafe_commands: bool = False) -> str:
             }
         )
     try:
-        result = subprocess.run(
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            "-c",
             command,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            stdin=subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
         )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (asyncio.TimeoutError, TimeoutError):
+            proc.kill()
+            await proc.wait()
+            raise
         return json.dumps(
             {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
+                "stdout": stdout_b.decode("utf-8", errors="replace"),
+                "stderr": stderr_b.decode("utf-8", errors="replace"),
+                "returncode": proc.returncode,
             }
         )
     except Exception as e:

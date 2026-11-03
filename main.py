@@ -360,11 +360,12 @@ async def execute_tool_calls(
                 args_short = args_short[0:200] + "..."
             emit(user_id, "tool", f"{name}({args_short})")
             try:
-                result = handler(**args)
-                if inspect.iscoroutine(result):
-                    output = await result
+                if inspect.iscoroutinefunction(handler):
+                    output = await handler(**args)
                 else:
-                    output = result
+                    # Offload blocking tools to a worker thread so the event loop
+                    # (UI rendering, interrupt polling, other clients) keeps running.
+                    output = await asyncio.to_thread(handler, **args)
             except Exception as e:
                 logger.exception(f"Tool {name} failed")
                 output = json.dumps({"error": f"Tool {name} raised an exception: {e}"})
@@ -702,6 +703,7 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
 
 CLIENTS = {
     "terminal": "clients.terminal",
+    "terminal_v2": "clients.terminal_v2",
     "discord_client": "clients.discord_client",
     "irc_client": "clients.irc_client",
 }
@@ -729,7 +731,7 @@ async def async_main(client_type: str, session_id: str | None = None):
     bus.bind()
     await main_init()
 
-    if resume and client_type == "terminal":
+    if resume and client_type in ("terminal", "terminal_v2"):
         try:
             bus.outbound.put_nowait(History(read_conversation(session_id)))
         except (OSError, ValueError) as e:
