@@ -4,5 +4,10 @@
         "url": "",
         "api_key": "",
         "model": ""
+    },
+    "compaction": {
+        "tail_turns": 10,
+        "trigger_pct": 80.0,
+        "target_pct": 30.0
     }
 }

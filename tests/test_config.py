@@ -32,7 +32,8 @@ class TestConfigLoading(unittest.TestCase):
             self.assertEqual(config.BASE_URL, defaults["server"]["url"])
             self.assertEqual(config.CURRENT_MODEL, defaults["server"]["model"])
             self.assertEqual(config.CLIENT, defaults.get("client", "terminal"))
-            self.assertEqual(config.COMPACTION_TAIL_TURNS, 6)  # built-in last resort still applies
+            self.assertEqual(config.COMPACTION_TAIL_TURNS, defaults["compaction"]["tail_turns"])
+            self.assertEqual(config.COMPACTION_TAIL_TURNS, 10)
         finally:
             if moved:
                 self.backup.rename(self.live)

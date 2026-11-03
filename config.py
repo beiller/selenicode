@@ -5,29 +5,22 @@ import pathlib
 _DEFAULTS = {
     "client": "terminal",
     "server": {"url": "", "api_key": "", "model": ""},
-    "compaction": {"tail_turns": 6, "trigger_pct": 80.0, "target_pct": 30.0},
 }
 
 
-def _config_path() -> pathlib.Path:
-    """Prefer the local config.json; fall back to the repo's config.defaults.json."""
-    path = pathlib.Path(__file__).parent / "config.json"
-    if not path.exists():
-        return pathlib.Path(__file__).parent / "config.defaults.json"
-    return path
-
-
 def _load() -> dict:
+    """Built-ins <- config.defaults.json (repo) <- config.json (local, wins)."""
     data = json.loads(json.dumps(_DEFAULTS))
-    path = _config_path()
-    if path.exists():
-        with open(path) as fh:
-            user = json.load(fh)
-        for key, value in user.items():
-            if isinstance(value, dict) and isinstance(data.get(key), dict):
-                data[key].update(value)
-            else:
-                data[key] = value
+    for name in ("config.defaults.json", "config.json"):
+        path = pathlib.Path(__file__).parent / name
+        if path.exists():
+            with open(path) as fh:
+                user = json.load(fh)
+            for key, value in user.items():
+                if isinstance(value, dict) and isinstance(data.get(key), dict):
+                    data[key].update(value)
+                else:
+                    data[key] = value
     return data
 
 
