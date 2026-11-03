@@ -1,16 +1,15 @@
 import json
 import logging
-import os
 
 import aiohttp
 
+import config
 from conversation import approximate_token_count
 from main_types import Message, SessionID
 from retry import HttpError, retry_fibonacci
 
 logger = logging.getLogger()
 
-DEFAULT_TAIL_TURNS = 2
 MIN_PRESERVE_RECENT_TOKENS = 2_000
 MAX_PRESERVE_RECENT_TOKENS = 8_000
 TOOL_OUTPUT_MAX_CHARS = 2_000
@@ -68,27 +67,22 @@ Rules:
 - Do not mention the summary process or that context was compacted."""
 
 
-def _pct(env_var: str, default: float) -> float:
-    raw = os.environ.get(env_var, str(default))
-    try:
-        pct = float(raw)
-    except ValueError:
-        logger.warning(f"Invalid {env_var}={raw!r}, using default {default:g}")
-        return default
+def _pct(name: str) -> float:
+    pct = float(getattr(config, name))
     if not 1 <= pct <= 100:
-        logger.warning(f"{env_var}={pct} out of range 1-100, clamping")
-        pct = min(max(pct, 1.0), 100.0)
+        logger.warning(f"{name}={pct} out of range 1-100, clamping")
+        return min(max(pct, 1.0), 100.0)
     return pct
 
 
 def compaction_trigger(context_size: int) -> int:
     """Auto-trigger threshold: compaction starts when context exceeds this (default: 80%)."""
-    return int(context_size * _pct("COMPACTION_TRIGGER_PCT", 80.0) / 100)
+    return int(context_size * _pct("COMPACTION_TRIGGER_PCT") / 100)
 
 
 def compaction_target(context_size: int) -> int:
-    """Shrink-to target: compaction stops once context is at or below this (default: 20%)."""
-    return int(context_size * _pct("COMPACTION_TARGET_PCT", 20.0) / 100)
+    """Shrink-to target: compaction stops once context is at or below this (default: 30%)."""
+    return int(context_size * _pct("COMPACTION_TARGET_PCT") / 100)
 
 
 def context_token_count(messages: list[Message]) -> int:
@@ -101,13 +95,7 @@ def preserve_recent_budget(context_size: int) -> int:
 
 
 def _tail_turns() -> int:
-    raw = os.environ.get("COMPACTION_TAIL_TURNS", str(DEFAULT_TAIL_TURNS))
-    try:
-        n = int(raw)
-    except ValueError:
-        logger.warning(f"Invalid COMPACTION_TAIL_TURNS={raw!r}, using default {DEFAULT_TAIL_TURNS}")
-        return DEFAULT_TAIL_TURNS
-    return max(0, n)
+    return max(0, int(config.COMPACTION_TAIL_TURNS))
 
 
 def turns(messages: list[Message]) -> list[list[int]]:

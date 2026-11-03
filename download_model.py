@@ -34,7 +34,7 @@ def download_model(repo_id: str, filename: str):
     from huggingface_hub import hf_hub_download
 
     # Default save directory
-    save_dir = Path(os.getenv("LLAMA_MODELS_DIR"))
+    save_dir = Path(os.getenv("LLAMA_MODELS_DIR", "./models"))
 
     # Create models directory if it doesn't exist
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -78,13 +78,6 @@ def download_model(repo_id: str, filename: str):
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-
-    load_dotenv(".env.defaults", override=False)
-
-    if os.path.exists(".env"):
-        load_dotenv(".env", override=True)
-
     MODEL_DOWNLOAD_REPO_ID = os.environ.get("MODEL_DOWNLOAD_REPO_ID") or "bartowski/Qwen3.8-27B-GGUF"
     MODEL_DOWNLOAD_FILENAME = os.environ.get("MODEL_DOWNLOAD_FILENAME") or "Qwen3.8-27B-Q4_K_M.gguf"
 

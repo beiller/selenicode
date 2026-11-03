@@ -1,22 +1,37 @@
-import os
+import json
+import pathlib
 
-# The single edge where environment is read: .env.defaults (base), then .env (user overrides).
-try:
-    from dotenv import load_dotenv
+# Single source of truth: built-in defaults, overridden by config.json (project root).
+_DEFAULTS = {
+    "client": "terminal",
+    "server": {"url": "http://127.0.0.1:8080", "api_key": "", "model": "Qwen_Qwen3.5-27B-Q4_1"},
+    "compaction": {"tail_turns": 6, "trigger_pct": 80.0, "target_pct": 30.0},
+}
 
-    load_dotenv(".env.defaults", override=False)
-    if os.path.exists(".env"):
-        load_dotenv(".env", override=True)
-except ImportError:
-    pass
 
-if "LLAMA_BASE_URL" not in os.environ:
-    os.environ["LLAMA_BASE_URL"] = "http://127.0.0.1:8080"
+def _load() -> dict:
+    data = json.loads(json.dumps(_DEFAULTS))
+    path = pathlib.Path(__file__).parent / "config.json"
+    if path.exists():
+        with open(path) as fh:
+            user = json.load(fh)
+        for key, value in user.items():
+            if isinstance(value, dict) and isinstance(data.get(key), dict):
+                data[key].update(value)
+            else:
+                data[key] = value
+    return data
 
-# Runtime source of truth for the model server URL; /server reassigns this.
-BASE_URL = os.environ["LLAMA_BASE_URL"]
-CURRENT_MODEL = os.environ.get("CURRENT_MODEL", "Qwen_Qwen3.5-27B-Q4_1")
-API_KEY = os.environ.get("LLAMA_API_KEY", "")
+
+_data = _load()
+
+CLIENT = _data["client"]
+BASE_URL = _data["server"]["url"]
+API_KEY = _data["server"]["api_key"]
+CURRENT_MODEL = _data["server"]["model"]
+COMPACTION_TAIL_TURNS = _data["compaction"]["tail_turns"]
+COMPACTION_TRIGGER_PCT = _data["compaction"]["trigger_pct"]
+COMPACTION_TARGET_PCT = _data["compaction"]["target_pct"]
 
 
 def auth_headers() -> dict[str, str]:

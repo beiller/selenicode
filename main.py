@@ -7,7 +7,6 @@ import importlib
 import inspect
 import json
 import logging
-import os
 import pathlib
 import random
 import string
@@ -856,18 +855,11 @@ async def async_main(client_type: str, session_id: str | None = None) -> None:
 
 
 if __name__ == "__main__":
-    exec_dir = os.path.dirname(os.path.abspath(__file__))
-
-    def load_config():
-        with open(f"{exec_dir}/config.json") as fh:
-            return json.loads(fh.read())
-
-    cfg = load_config()
-
+    client = config.CLIENT
     if len(sys.argv) > 1:
-        cfg["client"] = sys.argv[1]
+        client = sys.argv[1]
     session_id: str | None = None
     if len(sys.argv) > 2:
         session_id = sys.argv[2]
     # Run the async function with proper cancellation handling
-    asyncio.run(async_main(cfg.get("client", "terminal"), session_id))
+    asyncio.run(async_main(client, session_id))

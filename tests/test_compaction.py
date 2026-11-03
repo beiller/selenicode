@@ -9,6 +9,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import compaction
+import config
 
 REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "bakupte6.json"
 
@@ -16,14 +17,13 @@ REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "ba
 class CompactionBase(unittest.TestCase):
     def setUp(self):
         self.summarize_calls = []
-        self.env_patcher = mock.patch.dict(
-            os.environ,
-            {"COMPACTION_TRIGGER_PCT": "80", "COMPACTION_TARGET_PCT": "20", "COMPACTION_TAIL_TURNS": "2"},
+        self.cfg_patcher = mock.patch.multiple(
+            config, COMPACTION_TRIGGER_PCT=80.0, COMPACTION_TARGET_PCT=20.0, COMPACTION_TAIL_TURNS=2
         )
-        self.env_patcher.start()
+        self.cfg_patcher.start()
 
     def tearDown(self):
-        self.env_patcher.stop()
+        self.cfg_patcher.stop()
 
     def run_compact(self, messages, context_size=16384, summary="SUMMARY"):
         async def stub(base_url, model, system_prompt, msgs):
@@ -151,9 +151,9 @@ class TestPrune(CompactionBase):
 
 class TestBudget(CompactionBase):
     def test_preserve_recent_budget_clamps(self):
-        with mock.patch.dict(os.environ, {"COMPACTION_TARGET_PCT": "50"}):
+        with mock.patch.object(config, "COMPACTION_TARGET_PCT", 50.0):
             self.assertEqual(compaction.preserve_recent_budget(16384), 4096)
-        with mock.patch.dict(os.environ, {"COMPACTION_TARGET_PCT": "20"}):
+        with mock.patch.object(config, "COMPACTION_TARGET_PCT", 20.0):
             self.assertEqual(compaction.preserve_recent_budget(16384), 3276)
         self.assertEqual(compaction.preserve_recent_budget(1_000_000), 8000)
 
