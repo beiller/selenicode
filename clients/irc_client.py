@@ -4,6 +4,7 @@ import logging
 import ssl
 import sys
 import uuid
+from typing import Callable
 
 import irc.client
 
@@ -78,7 +79,7 @@ def on_privmsg(connection, event):
     _bus.post(UserMessage(user_id, message, uuid.uuid4().hex[:8]))
 
 
-async def run(bus: Bus, context_size: int = 0) -> None:
+async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> None:
     """Connect to IRC and consume outbound events until cancelled."""
     global reactor, connection, _bus
     _bus = bus

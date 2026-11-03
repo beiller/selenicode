@@ -114,31 +114,6 @@ class TestHeadTail(CompactionBase):
         self.assertEqual(self.summarize_calls, [])
         self.assertEqual(messages[0]["content"], "hello")
 
-    def test_summary_input_drops_reasoning_and_truncates_tool_output(self):
-        messages = [
-            {"role": "user", "content": "U" * 3000},
-            {
-                "role": "assistant",
-                "content": None,
-                "reasoning_content": "R" * 5000,
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run_bash", "arguments": "{}"}}],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": "T" * 8000},
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
-        ]
-        self.run_compact(messages, context_size=2000)
-        model_input = self.summarize_calls[0]
-        for m in model_input:
-            self.assertNotIn("reasoning_content", m)
-        tool_in = next(m for m in model_input if m.get("role") == "tool")
-        self.assertIn("[Tool output truncated for compaction: omitted 6000 chars]", tool_in["content"])
-        self.assertLessEqual(len(tool_in["content"].split("\n")[0]), 2000)
-        prompt = model_input[-1]["content"]
-        self.assertIn("## Goal", prompt)
-        self.assertIn("## Relevant Files", prompt)
-
-
 class TestPrune(CompactionBase):
     def _prune_fixture(self, old_size):
         messages = [

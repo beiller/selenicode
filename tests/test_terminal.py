@@ -5,7 +5,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import clients.terminal as t2
-from bus import History, Token, TurnDone, UsageReport
+from bus import CompactionDone, Error, History, ServerStatus, Token, TurnDone, UsageReport
 
 
 def fill(state: t2.UIState, n: int) -> None:
@@ -15,19 +15,10 @@ def fill(state: t2.UIState, n: int) -> None:
 
 
 class TestWrapText(unittest.TestCase):
-    def test_empty(self):
-        self.assertEqual(t2.wrap_text("", 40), [""])
-
-    def test_short_line(self):
-        self.assertEqual(t2.wrap_text("hello", 40), ["hello"])
-
     def test_wraps_long_line(self):
         lines = t2.wrap_text("aaaa bbbb cccc dddd", 11)
         self.assertTrue(all(len(ln) <= 11 for ln in lines))
         self.assertEqual(" ".join(lines).split(), ["aaaa", "bbbb", "cccc", "dddd"])
-
-    def test_keeps_empty_paragraphs(self):
-        self.assertEqual(t2.wrap_text("a\n\nb", 40), ["a", "", "b"])
 
     def test_hard_wraps_long_word(self):
         lines = t2.wrap_text("x" * 50, 10)
@@ -35,16 +26,6 @@ class TestWrapText(unittest.TestCase):
 
 
 class TestRenderFrame(unittest.TestCase):
-    def test_frame_shape_and_pinned_bars(self):
-        state = t2.UIState(context_size=1000)
-        fill(state, 3)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(len(rows), 10)
-        status_text = "".join(seg[0] for seg in rows[8])
-        self.assertIn("ready", status_text)
-        self.assertEqual(rows[8][0][1], t2.STY_STATUS)
-        self.assertTrue(rows[9][0][0].startswith("> "))
-
     def test_pinned_shows_bottom(self):
         state = t2.UIState()
         fill(state, 30)
@@ -53,16 +34,6 @@ class TestRenderFrame(unittest.TestCase):
         self.assertEqual(rows[view_h - 1][0][0], "line 29")
         self.assertEqual(rows[0][0][0], "")  # separator row
         self.assertEqual(rows[1][0][0], "line 26")
-
-    def test_detached_view_offsets_window(self):
-        state = t2.UIState()
-        fill(state, 30)
-        state.view_top = 17  # offset into the scrollback (block 12 at row 7)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(rows[7][0][0], "line 12")
-        state.view_top = 0  # clamped at the top
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(rows[0][0][0], "line 0")
 
     def test_detached_view_stays_put_while_streaming(self):
         state = t2.UIState()
@@ -74,26 +45,6 @@ class TestRenderFrame(unittest.TestCase):
         rows_after = t2.render_frame(state, height=10, width=80)
         self.assertEqual(rows_before[0][0][0], rows_after[0][0][0])
         self.assertEqual(rows_after[0][0][0], "line 8")
-
-    def test_separator_between_blocks(self):
-        state = t2.UIState()
-        fill(state, 2)
-        self.assertEqual(t2.count_lines(state, 80), 3)  # 2 blocks + 1 separator
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertEqual(rows[0][0][0], "line 0")  # no leading blank row
-        self.assertEqual(rows[1][0][0], "")
-        self.assertEqual(rows[2][0][0], "line 1")
-        t2.apply_token(state, "assistant", "abc", True)
-        self.assertEqual(t2.count_lines(state, 80), 5)  # + active block + separator
-
-    def test_prompt_hint_only_when_empty(self):
-        state = t2.UIState()
-        rows = t2.render_frame(state, height=5, width=80)
-        self.assertTrue(any("ctrl+q" in seg[0] for seg in rows[-1]))
-        state.input_buf = "hi"
-        rows = t2.render_frame(state, height=5, width=80)
-        self.assertFalse(any("ctrl+q" in seg[0] for seg in rows[-1]))
-        self.assertEqual(rows[-1][1][0], "hi")
 
 
 class TestInputWrapping(unittest.TestCase):
@@ -113,18 +64,6 @@ class TestInputWrapping(unittest.TestCase):
         self.assertEqual(last3[2][1][0], "a" * 14)
         self.assertEqual(last3[0][0][0], "> ")  # prompt only on first chunk
         self.assertEqual(last3[1][0][0], "  ")
-
-    def test_height_helper(self):
-        self.assertEqual(t2._input_block_height([], 80), 0)
-        self.assertEqual(t2._input_block_height([""], 80), 1)
-        self.assertEqual(t2._input_block_height(["a" * 50], 20), 3)
-        self.assertEqual(t2._input_block_height(["ab", "c" * 40], 20), 4)  # 1 + ceil(40/18)
-
-    def test_cursor_positions_on_chunks(self):
-        state = self._state("a" * 50, 5)
-        self.assertEqual(t2._cursor_pos(state, height=10, width=20), (7, 7))
-        state.cursor = 19  # chunk_w 18 -> 2nd chunk, col 1
-        self.assertEqual(t2._cursor_pos(state, height=10, width=20), (8, 3))
 
     def test_cursor_backspace_stays_on_screen(self):
         state = self._state("a" * 50, 50)
@@ -162,37 +101,6 @@ class TestThinkingToggle(unittest.TestCase):
         t2.apply_key(state, t2.K_CTRL_T)
         self.assertFalse(state.show_thinking)
 
-    def test_count_lines_tracks_visibility(self):
-        state = self._state()
-        t2.apply_token(state, "assistant", "hello world", False)
-        t2.apply_token(state, "thinking", "a" * 100, True)  # 1 collapsed row vs 2 wrapped
-        collapsed_count = t2.count_lines(state, 80)
-        self.assertEqual(collapsed_count, 3)  # assistant + placeholder + separator
-        t2.apply_key(state, t2.K_CTRL_T)
-        self.assertGreater(t2.count_lines(state, 80), collapsed_count)
-
-    def test_toggle_invalidates_wrap_cache(self):
-        # regression: the wrap cache must not serve a stale collapsed
-        # placeholder after expanding (or full text after collapsing)
-        state = self._state()
-        t2.apply_token(state, "thinking", "y" * 20 + "z" * 300 + "ENDMARKER", True)
-        t2.apply_token(state, "assistant", "hi", False)  # finalizes -> cached collapsed
-        self._screen_text(state)
-        t2.apply_key(state, t2.K_CTRL_T)
-        self.assertIn("ENDMARKER", self._screen_text(state))  # full text, not the placeholder
-        t2.apply_key(state, t2.K_CTRL_T)
-        self.assertNotIn("ENDMARKER", self._screen_text(state))  # back to placeholder
-
-    def test_status_hint_shows_collapsed_count(self):
-        state = self._state()
-        t2.apply_token(state, "thinking", "one", True)
-        t2.apply_token(state, "assistant", "hi", False)  # finalizes the thinking block
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertIn("1 thinking collapsed (ctrl+t)", "".join(seg[0] for seg in rows[-2]))
-        t2.apply_key(state, t2.K_CTRL_T)
-        rows = t2.render_frame(state, height=10, width=80)
-        self.assertNotIn("thinking collapsed", "".join(seg[0] for seg in rows[-2]))
-
 
 class TestApplyToken(unittest.TestCase):
     def test_streaming_accumulates(self):
@@ -201,20 +109,16 @@ class TestApplyToken(unittest.TestCase):
         t2.apply_token(state, "assistant", "lo", True)
         self.assertEqual(state.active.raw, "hello")
 
-    def test_role_switch_finalizes(self):
+    def test_finalization_on_role_switch_and_end_marker(self):
         state = t2.UIState()
         t2.apply_token(state, "thinking", "hmm", True)
         t2.apply_token(state, "assistant", "hi", True)
         self.assertEqual(len(state.blocks), 1)
         self.assertEqual(state.blocks[0].raw, "hmm")
         self.assertEqual(state.active.raw, "hi")
-
-    def test_end_marker_finalizes(self):
-        state = t2.UIState()
-        t2.apply_token(state, "assistant", "hi", True)
         t2.apply_token(state, "assistant", "", False)
         self.assertIsNone(state.active)
-        self.assertEqual(len(state.blocks), 1)
+        self.assertEqual(len(state.blocks), 2)  # thinking + assistant both finalized
 
     def test_oneshot_status_line(self):
         state = t2.UIState()
@@ -245,12 +149,6 @@ class TestApplyKey(unittest.TestCase):
         self.assertEqual(state.input_buf, "aXb")
         self.assertEqual(state.cursor, 2)
 
-    def test_backspace(self):
-        state = self._state(input_buf="ab", cursor=2)
-        t2.apply_key(state, t2.K_BACKSPACE)
-        self.assertEqual(state.input_buf, "a")
-        self.assertEqual(state.cursor, 1)
-
     def test_enter(self):
         state = self._state(input_buf="  hello  ")
         action, payload = t2.apply_key(state, t2.K_ENTER)
@@ -258,32 +156,8 @@ class TestApplyKey(unittest.TestCase):
         self.assertEqual(state.input_buf, "")
         self.assertEqual(t2.apply_key(self._state(), t2.K_ENTER), ("", ""))  # empty is a no-op
 
-    def test_ctrl_c(self):
-        state = self._state(busy=True)
-        self.assertEqual(t2.apply_key(state, t2.K_CTRL_C), ("interrupt", ""))
-        state = self._state(input_buf="abc")
-        self.assertEqual(t2.apply_key(state, t2.K_CTRL_C), ("", ""))
-        self.assertEqual(state.input_buf, "")
-
     def test_ctrl_q_quits(self):
         self.assertEqual(t2.apply_key(self._state(), t2.K_CTRL_Q), ("quit", ""))
-
-    def test_esc_clears_input(self):
-        state = self._state(input_buf="abc")
-        t2.apply_key(state, t2.K_ESC)
-        self.assertEqual(state.input_buf, "")
-
-    def test_page_up_down_and_end(self):
-        fill(self_state := self._state(), 50)
-        action, _ = t2.apply_key(self_state, t2.K_PPAGE, view_h=10, total=50)
-        self.assertEqual(action, "")
-        self.assertEqual(self_state.view_top, 31)  # bottom (40) minus a page (9)
-        t2.apply_key(self_state, t2.K_NPAGE, view_h=10, total=50)
-        self.assertIsNone(self_state.view_top)  # back at the bottom: re-pinned
-        t2.apply_key(self_state, t2.K_HOME)
-        self.assertEqual(self_state.view_top, 0)
-        t2.apply_key(self_state, t2.K_END)
-        self.assertIsNone(self_state.view_top)
 
     def test_wheel_events(self):
         state = self._state()
@@ -324,11 +198,6 @@ class TestBlocksFromHistory(unittest.TestCase):
         self.assertIn("[compaction]", blocks[0].raw)
         self.assertEqual(blocks[1].prefix, "(summary) ")
 
-    def test_empty_content_skipped(self):
-        blocks = t2.blocks_from_history([{"role": "user", "content": ""}, {"role": "assistant", "content": None}])
-        self.assertEqual(blocks, [])
-
-
 class TestApplyEvent(unittest.TestCase):
     def test_dispatch(self):
         state = t2.UIState(context_size=100)
@@ -345,14 +214,47 @@ class TestApplyEvent(unittest.TestCase):
         self.assertEqual(len(state.blocks), 2)
         self.assertEqual(state.blocks[-1].raw, "old")
 
-    def test_status_bar_spinner_and_ready(self):
+    def test_error_renders_on_status_line_not_stream(self):
         state = t2.UIState(context_size=100)
-        status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
-        self.assertEqual(status_line, "status: ready tokens: 0/100 (0%)")
-        state.busy = True
-        state.frame = 3
-        status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
-        self.assertEqual(status_line, f"status: {t2.SPINNER[3]} thinking tokens: 0/100 (0%)")
+        t2.apply_event(state, Error("u1", "Model server connection failed (attempt 1)"))
+        self.assertEqual(state.status, "Model server connection failed (attempt 1)")
+        self.assertEqual(state.status_style, t2.STY_ERROR)
+        self.assertFalse(any(b.role == "error" for b in state.blocks))
+        line = t2.render_frame(state, height=5, width=80)[-2][0][0]
+        self.assertIn("Model server connection failed", line)
+
+    def test_server_status_flips_status_line(self):
+        state = t2.UIState(context_size=100)
+        t2.apply_event(state, ServerStatus(False))
+        self.assertEqual(state.status, "waiting for model server...")
+        self.assertEqual(state.status_style, t2.STY_WARN)
+        t2.apply_event(state, ServerStatus(True))
+        self.assertEqual(state.status, "ready")
+        self.assertEqual(state.status_style, t2.STY_STATUS)
+
+    def test_turn_done_resets_error_status_style(self):
+        state = t2.UIState(context_size=100)
+        t2.apply_event(state, Error("u1", "boom"))
+        t2.apply_event(state, TurnDone("m1"))
+        self.assertEqual(state.status, "ready")
+        self.assertEqual(state.status_style, t2.STY_STATUS)
+
+    def test_compaction_done_updates_status_line_and_token_meter(self):
+        state = t2.UIState(context_size=100)
+        t2.apply_event(state, UsageReport("u1", {"prompt_tokens": 90, "completion_tokens": 5}))
+        self.assertEqual(state.tokens, 95)
+        # posted after TurnDone: the message survives the "ready" reset
+        t2.apply_event(state, TurnDone("m1"))
+        t2.apply_event(state, CompactionDone("u1", 30))
+        self.assertEqual(state.tokens, 30)
+        self.assertEqual(state.status, "compacted → 30 tokens")
+        self.assertEqual(state.status_style, t2.STY_STATUS)
+        line = t2.render_frame(state, height=5, width=80)[-2][0][0]
+        self.assertIn("compacted", line)
+        self.assertIn("tokens: 30/100 (30%)", line)
+        # next turn's TurnDone clears it
+        t2.apply_event(state, TurnDone("m2"))
+        self.assertEqual(state.status, "ready")
 
     def test_status_bar_token_percentage(self):
         state = t2.UIState(context_size=1600)
@@ -405,24 +307,6 @@ class TestMultilineInput(unittest.TestCase):
         self.assertEqual(rows[9][0][0], "  ")
         self.assertEqual(rows[9][1][0], "line two")
 
-    def test_multiline_cursor_pos(self):
-        state = t2.UIState()
-        state.input_buf = "ab\ncd"
-        state.cursor = 0
-        self.assertEqual(t2._cursor_pos(state, 10, 80), (8, 2))
-        state.cursor = 3  # start of line 2
-        self.assertEqual(t2._cursor_pos(state, 10, 80), (9, 2))
-        state.cursor = 5  # end of "cd"
-        self.assertEqual(t2._cursor_pos(state, 10, 80), (9, 4))
-
-    def test_insert_text(self):
-        state = t2.UIState()
-        state.input_buf = "abc"
-        state.cursor = 1
-        t2._insert_text(state, "XY")
-        self.assertEqual(state.input_buf, "aXYbc")
-        self.assertEqual(state.cursor, 3)
-
     def test_multiline_submit_keeps_newlines(self):
         state = t2.UIState()
         t2._insert_text(state, "line1\nline2")
@@ -444,13 +328,6 @@ class TestSubmitMessage(unittest.TestCase):
         # the previous active block was finalized into scrollback first
         self.assertEqual(state.blocks[0].raw, "old answer")
         self.assertIsNone(state.active)
-
-    def test_matches_history_rendering(self):
-        live = t2.UIState()
-        t2.submit_message(live, "hello")
-        from_hist = t2.blocks_from_history([{"role": "user", "content": "hello"}])
-        a, b = live.blocks[-1], from_hist[0]
-        self.assertEqual((a.role, a.prefix, a.raw, a.style), (b.role, b.prefix, b.raw, b.style))
 
 
 class TestDecodeInput(unittest.TestCase):

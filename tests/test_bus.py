@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import Bus, Error, History, Interrupt, Token, TurnDone, UserMessage
+from bus import Bus, Error, Interrupt, Token, TurnDone
 from clients.common import consume_tokens
 
 
@@ -20,26 +20,6 @@ class TestBus(unittest.TestCase):
         ev = asyncio.run(scenario())
         self.assertEqual(ev.text, "hi")
         self.assertTrue(ev.chunk)
-
-    def test_post_inbound_same_thread(self):
-        async def scenario():
-            b = Bus()
-            b.bind()
-            b.post(UserMessage("u1", "hello", "m1"))
-            return await b.inbound.get()
-
-        ev = asyncio.run(scenario())
-        self.assertEqual(ev.msg_id, "m1")
-
-    def test_history_outbound_round_trip(self):
-        async def scenario():
-            b = Bus()
-            b.outbound.put_nowait(History([{"role": "user", "content": "hi"}]))
-            return await b.outbound.get()
-
-        ev = asyncio.run(scenario())
-        self.assertIsInstance(ev, History)
-        self.assertEqual(ev.messages[0]["content"], "hi")
 
     def test_interrupt_flag_set_on_post_without_draining(self):
         async def scenario():

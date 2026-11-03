@@ -63,7 +63,33 @@ class History:
     messages: list[dict]
 
 
-Event = UserMessage | Interrupt | Shutdown | Token | TurnDone | UsageReport | Error | History
+@dataclass(frozen=True)
+class ServerStatus:
+    """Outbound: model-server connectivity state (drives the terminal status line)."""
+
+    connected: bool
+
+
+@dataclass(frozen=True)
+class CompactionDone:
+    """Outbound: compaction finished; tokens_after is the new local estimate (status line + token meter)."""
+
+    user_id: str
+    tokens_after: int
+
+
+Event = (
+    UserMessage
+    | Interrupt
+    | Shutdown
+    | Token
+    | TurnDone
+    | UsageReport
+    | Error
+    | History
+    | ServerStatus
+    | CompactionDone
+)
 
 
 class Bus:

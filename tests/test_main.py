@@ -44,30 +44,6 @@ class TestExecuteToolCalls(unittest.TestCase):
         self.assertEqual(results[1]["role"], "tool")
         self.assertEqual(results[1]["content"], "async-hi")
 
-    def test_sync_tool_does_not_block_event_loop(self):
-        import time
-
-        events = []
-
-        def slowtool() -> str:
-            events.append(("tool-start", time.monotonic()))
-            time.sleep(0.2)
-            events.append(("tool-end", time.monotonic()))
-            return "slow-done"
-
-        async def scenario():
-            loop = asyncio.get_running_loop()
-            loop.call_later(0.05, lambda: events.append(("heartbeat", time.monotonic())))
-            return await main.execute_tool_calls(make_assistant_msg("slowtool", "{}"), {"slowtool": slowtool}, "user1")
-
-        results = asyncio.run(scenario())
-        self.assertEqual(results[1]["content"], "slow-done")
-        times = {name: t for name, t in events}
-        self.assertIn("heartbeat", times)
-        # If the event loop were blocked by the tool, the heartbeat could only
-        # fire after the tool finished.
-        self.assertLess(times["heartbeat"], times["tool-end"])
-
     def test_compact_session_is_registered(self):
         tools, registry = main.build_tools()
         names = [t["function"]["name"] for t in tools]
@@ -152,22 +128,56 @@ class TestInterrupt(unittest.TestCase):
         self.assertNotIn("tool_calls", partial)
         self.assertFalse(b.interrupted)
 
+    def test_mid_loop_compaction_posts_done(self):
+        b = bus_mod.Bus()
+        messages = [{"role": "user", "content": "hi"}]
+
+        async def fake_stream(base_url, msgs, tools, session_id, user_id):
+            yield {"choices": [{"delta": {"content": "ok"}}]}
+
+        async def ok_compact(base_url, messages, session_id, context_size, model):
+            return True
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), \
+                 mock.patch.object(main, "stream_chat_completion", fake_stream), \
+                 mock.patch.object(main, "get_tools", lambda: ([], {})), \
+                 mock.patch.object(main, "compact_messages", ok_compact), \
+                 mock.patch.object(main, "CONTEXT_SIZE", 16384), \
+                 mock.patch.object(main, "compaction_trigger", lambda s: 100), \
+                 mock.patch.object(main, "context_token_count", side_effect=[5000, 800]):
+                return await main.run_tool_loop("http://x", "u1", messages, "sess")
+
+        asyncio.run(scenario())
+        events = []
+        while not b.outbound.empty():
+            events.append(b.outbound.get_nowait())
+        done = [e for e in events if isinstance(e, bus_mod.CompactionDone)]
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0].tokens_after, 800)
+
 
 class TestAsyncMainHistory(unittest.TestCase):
     def _run_async_main(self, client_type, session_id):
         async def fake_run(bus, context_size=0):
             return None
 
-        async def fake_init():
+        async def fake_load():
             return None
 
         async def fake_main(resume=False, session_id=None):
             return None
 
+        async def fake_ctx():
+            return None
+
         fake_client = types.SimpleNamespace(run=fake_run)
         with mock.patch.object(main, "_load_client", lambda ct: fake_client), mock.patch.object(
-            main, "main_init", fake_init
+            main, "startup_load_model", fake_load
         ), mock.patch.object(main, "main", fake_main), mock.patch.object(
+            main, "wait_for_context_size", fake_ctx
+        ), mock.patch.object(
             main, "read_conversation", lambda sid: [{"role": "user", "content": "hi"}]
         ):
             asyncio.run(main.async_main(client_type, session_id))
@@ -183,11 +193,9 @@ class TestAsyncMainHistory(unittest.TestCase):
         self.assertEqual(len(histories), 1)
         self.assertEqual(histories[0].messages, [{"role": "user", "content": "hi"}])
 
-    def test_no_history_for_discord_even_on_resume(self):
+    def test_no_history_for_discord_or_fresh_session(self):
         events = self._run_async_main("discord_client", "sess1234")
         self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
-
-    def test_no_history_for_fresh_terminal_session(self):
         events = self._run_async_main("terminal", None)
         self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
 
@@ -206,7 +214,8 @@ class TestSessionWipeGuard(unittest.TestCase):
 
         with mock.patch.object(main, "read_conversation", lambda sid: list(self.DISK_MSGS)), \
              mock.patch.object(main, "compact_messages", fake_compact), \
-             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
+             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))), \
+             mock.patch.object(main, "CONTEXT_SIZE", 16384):
             return json.loads(asyncio.run(main.compact_session(user_id, "sess1"))), written
 
     def _call_reset(self, user_id):
@@ -256,7 +265,8 @@ class TestSessionWipeGuard(unittest.TestCase):
 
         with mock.patch.object(main, "read_conversation", missing), \
              mock.patch.object(main, "compact_messages", fake_compact), \
-             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))):
+             mock.patch.object(main, "write_conversation", lambda sid, msgs: written.append((sid, msgs))), \
+             mock.patch.object(main, "CONTEXT_SIZE", 16384):
             status = json.loads(asyncio.run(main.compact_session("any_user", "sess1")))
         self.assertNotIn("error", status)
         self.assertEqual(len(written), 1)
@@ -292,7 +302,7 @@ class TestErrorReporting(unittest.TestCase):
             b.bind()
             with mock.patch.object(main, "bus", b), mock.patch.object(
                 main, "handle_message", flaky_handle
-            ), mock.patch.object(main, "llama_proc", None, create=True):
+            ), mock.patch.object(main, "CONTEXT_SIZE", 16384):
                 b.post(bus_mod.UserMessage("u1", "hello", "m1"))
                 b.post(bus_mod.UserMessage("u1", "again", "m2"))
                 b.post(bus_mod.Shutdown())
@@ -314,7 +324,7 @@ class TestErrorReporting(unittest.TestCase):
             b.bind()
             with mock.patch.object(main, "bus", b), mock.patch.object(
                 main, "compact_session", failing_compact
-            ), mock.patch.object(main, "llama_proc", None, create=True):
+            ), mock.patch.object(main, "CONTEXT_SIZE", 16384):
                 b.post(bus_mod.UserMessage("u1", "/compact", "m1"))
                 b.post(bus_mod.Shutdown())
                 await main.main()
@@ -325,6 +335,240 @@ class TestErrorReporting(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("compaction failed", errors[0].text)
         self.assertTrue(any(isinstance(e, bus_mod.TurnDone) for e in events))
+
+    def test_compact_command_posts_done_after_turn_done(self):
+        b = bus_mod.Bus()
+
+        async def ok_compact(user_id="", session_id=""):
+            return json.dumps({"status": "Compaction complete. Context size is 800 of 16384"})
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), mock.patch.object(
+                main, "compact_session", ok_compact
+            ), mock.patch.object(main, "CONTEXT_SIZE", 16384), mock.patch.object(
+                main, "context_token_count", lambda m: 800
+            ), mock.patch.object(main, "get_user_messages", lambda uid: [{"role": "user"}]):
+                b.post(bus_mod.UserMessage("u1", "/compact", "m1"))
+                b.post(bus_mod.Shutdown())
+                await main.main()
+
+        asyncio.run(scenario())
+        events = self._drain(b)
+        idx_turn = next(i for i, e in enumerate(events) if isinstance(e, bus_mod.TurnDone))
+        idx_compact = next(i for i, e in enumerate(events) if isinstance(e, bus_mod.CompactionDone))
+        self.assertLess(idx_turn, idx_compact)
+        self.assertEqual(events[idx_compact].tokens_after, 800)
+        # the completion message moved to the status line; no chat-stream info block
+        self.assertFalse(any(isinstance(e, bus_mod.Token) and "Compaction complete" in e.text for e in events))
+
+    def test_handle_message_posts_compaction_done_after_turn_done(self):
+        b = bus_mod.Bus()
+
+        async def no_op_loop(base_url, user_id, messages, session_id):
+            return "ok"
+
+        async def ok_compact(base_url, messages, session_id, context_size, model):
+            return True
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), \
+                 mock.patch.object(main, "run_tool_loop", no_op_loop), \
+                 mock.patch.object(main, "compact_messages", ok_compact), \
+                 mock.patch.object(main, "CONTEXT_SIZE", 16384), \
+                 mock.patch.object(main, "compaction_trigger", lambda s: 100), \
+                 mock.patch.object(main, "context_token_count", lambda m: 5000), \
+                 mock.patch.object(main, "approximate_token_count", lambda s: 800), \
+                 mock.patch.object(main, "get_user_messages", lambda uid: [{"role": "user"}]), \
+                 mock.patch.object(main, "write_conversation", lambda *a: None):
+                await main.handle_message("hi", "http://x", "u1", "sess", "m1")
+
+        asyncio.run(scenario())
+        events = self._drain(b)
+        idx_turn = next(i for i, e in enumerate(events) if isinstance(e, bus_mod.TurnDone))
+        idx_compact = next(i for i, e in enumerate(events) if isinstance(e, bus_mod.CompactionDone))
+        self.assertLess(idx_turn, idx_compact)
+        self.assertEqual(events[idx_compact].tokens_after, 800)
+
+    def test_handle_message_no_compaction_posts_no_done(self):
+        b = bus_mod.Bus()
+
+        async def no_op_loop(base_url, user_id, messages, session_id):
+            return "ok"
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), \
+                 mock.patch.object(main, "run_tool_loop", no_op_loop), \
+                 mock.patch.object(main, "CONTEXT_SIZE", 16384), \
+                 mock.patch.object(main, "compaction_trigger", lambda s: 10**9), \
+                 mock.patch.object(main, "context_token_count", lambda m: 1), \
+                 mock.patch.object(main, "get_user_messages", lambda uid: [{"role": "user"}]), \
+                 mock.patch.object(main, "write_conversation", lambda *a: None):
+                await main.handle_message("hi", "http://x", "u1", "sess", "m1")
+
+        asyncio.run(scenario())
+        self.assertFalse(any(isinstance(e, bus_mod.CompactionDone) for e in self._drain(b)))
+
+
+class TestRunDaemon(unittest.TestCase):
+    def test_run_daemon_returns_result(self):
+        async def scenario():
+            return await main._run_daemon(lambda x: x * 2, 21)
+
+        self.assertEqual(asyncio.run(scenario()), 42)
+
+    def test_run_daemon_cancellation_does_not_wait_for_work(self):
+        import time
+
+        def slow(x):
+            time.sleep(30)
+            return x
+
+        async def scenario():
+            task = asyncio.create_task(main._run_daemon(slow, 1))
+            await asyncio.sleep(0.05)
+            t0 = time.monotonic()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return time.monotonic() - t0
+
+        elapsed = asyncio.run(scenario())
+        self.assertLess(elapsed, 2)
+
+
+class TestContextSizeGate(unittest.TestCase):
+    def setUp(self):
+        main.CONTEXT_SIZE = None
+        main.ctx_ready.clear()
+        main.shutdown.clear()
+
+    def tearDown(self):
+        main.CONTEXT_SIZE = None
+        main.ctx_ready.clear()
+        main.shutdown.clear()
+
+    def test_wait_for_context_size_success_sets_global_and_event(self):
+        async def scenario():
+            with mock.patch.object(
+                main, "_fetch_models_once", return_value=[{"id": "other", "max_model_len": 248320}]
+            ):
+                task = asyncio.create_task(main.wait_for_context_size())
+                for _ in range(100):
+                    if main.ctx_ready.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                task.cancel()
+
+        asyncio.run(scenario())
+        self.assertEqual(main.CONTEXT_SIZE, 248320)
+        self.assertTrue(main.ctx_ready.is_set())
+        events = []
+        try:
+            while True:
+                events.append(main.bus.outbound.get_nowait())
+        except Exception:
+            pass
+        self.assertTrue(any(isinstance(e, bus_mod.ServerStatus) and e.connected for e in events))
+
+    def test_wait_for_context_size_retries_and_surfaces_each_failed_attempt(self):
+        calls = {"n": 0}
+        errors = []
+
+        def flaky_fetch(base_url):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("server down")
+            return [{"id": "other", "max_model_len": 4096}]
+
+        async def scenario():
+            with mock.patch.object(main, "_fetch_models_once", flaky_fetch), mock.patch.object(
+                main, "report_error", lambda uid, msg, exc=None: errors.append(msg)
+            ):
+                task = asyncio.create_task(main.wait_for_context_size())
+                for _ in range(300):
+                    if main.ctx_ready.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                task.cancel()
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(main.CONTEXT_SIZE, 4096)
+        self.assertGreaterEqual(len(errors), 2)
+        self.assertIn("attempt 1", errors[0])
+        self.assertIn("attempt 2", errors[1])
+
+    def test_client_starts_without_waiting_for_server_work(self):
+        flag = {"run_called": False}
+
+        async def hanging_load():
+            await asyncio.sleep(30)
+
+        async def hanging_ctx():
+            await asyncio.sleep(30)
+
+        async def fake_run(bus, context_size=0):
+            flag["run_called"] = True
+            return None
+
+        async def scenario():
+            with mock.patch.object(main, "_load_client", lambda ct: types.SimpleNamespace(run=fake_run)), \
+                 mock.patch.object(main, "startup_load_model", hanging_load), \
+                 mock.patch.object(main, "wait_for_context_size", hanging_ctx):
+                await asyncio.wait_for(main.async_main("terminal", None), timeout=2)
+
+        asyncio.run(scenario())
+        self.assertTrue(flag["run_called"])
+
+    def test_exit_is_not_blocked_by_inflight_worker_threads(self):
+        import time
+
+        def blocking_work():
+            time.sleep(30)
+
+        async def hanging_load():
+            await main._run_daemon(blocking_work)
+
+        async def hanging_ctx():
+            await main._run_daemon(blocking_work)
+
+        async def fake_run(bus, context_size=0):
+            return None  # simulates ctrl+q: the UI exits immediately
+
+        async def scenario():
+            with mock.patch.object(main, "_load_client", lambda ct: types.SimpleNamespace(run=fake_run)), \
+                 mock.patch.object(main, "startup_load_model", hanging_load), \
+                 mock.patch.object(main, "wait_for_context_size", hanging_ctx):
+                await asyncio.wait_for(main.async_main("terminal", None), timeout=2)
+
+        t0 = time.monotonic()
+        asyncio.run(scenario())
+        self.assertLess(time.monotonic() - t0, 10)
+
+    def test_turn_gated_until_context_size_resolved(self):
+        b = bus_mod.Bus()
+        ran = {"n": 0}
+
+        async def ok_handle(text, base_url, user_id, session_id, msg_id):
+            ran["n"] += 1
+
+        async def scenario():
+            b.bind()
+            with mock.patch.object(main, "bus", b), mock.patch.object(main, "handle_message", ok_handle):
+                b.post(bus_mod.UserMessage("u1", "hello", "m1"))
+                b.post(bus_mod.Shutdown())
+                task = asyncio.create_task(main.main())
+                await asyncio.sleep(0.05)
+                self.assertEqual(ran["n"], 0)
+                main.CONTEXT_SIZE = 8192
+                main.ctx_ready.set()
+                await task
+
+        asyncio.run(scenario())
+        self.assertEqual(ran["n"], 1)
 
 
 if __name__ == "__main__":

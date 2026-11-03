@@ -28,8 +28,21 @@ import textwrap
 import time
 import unicodedata
 import uuid
+from typing import Callable
 
-from bus import Bus, Error, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+from bus import (
+    Bus,
+    CompactionDone,
+    Error,
+    History,
+    Interrupt,
+    ServerStatus,
+    Shutdown,
+    Token,
+    TurnDone,
+    UsageReport,
+    UserMessage,
+)
 
 logger = logging.getLogger()
 
@@ -62,6 +75,7 @@ STY_TOOL = 3
 STY_INFO = 4
 STY_STATUS = 5
 STY_ERROR = 6
+STY_WARN = 7
 
 _ROLE_STYLE = {
     "thinking": STY_DIM,
@@ -93,7 +107,7 @@ class Block:
 class UIState:
     """All UI state; every mutator is a pure-ish function testable headless."""
 
-    def __init__(self, context_size: int = 0) -> None:
+    def __init__(self, context_size: int | Callable[[], int | None] = 0) -> None:
         self.blocks: list[Block] = []
         self.active: Block | None = None
         self.cache: dict[int, tuple[int, list]] = {}  # id(block) -> (width, lines)
@@ -105,6 +119,7 @@ class UIState:
         self.cursor = 0
         self.show_thinking = False  # ctrl+t toggles; collapsed to a placeholder line by default
         self.status = "ready"
+        self.status_style = STY_STATUS
         self.busy = False
         self.tokens = 0
         self.context_size = context_size
@@ -189,16 +204,17 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
         rows.append(all_lines[idx] if idx < total else [("", STY_PLAIN)])
 
     label = f"{SPINNER[state.frame % len(SPINNER)]} thinking" if state.busy else state.status
-    if state.context_size:
-        pct = int(state.tokens * 100 / state.context_size)
-        tok = f" tokens: {state.tokens}/{state.context_size} ({pct}%)"
+    cs = state.context_size() if callable(state.context_size) else state.context_size
+    if cs:
+        pct = int(state.tokens * 100 / cs)
+        tok = f" tokens: {state.tokens}/{cs} ({pct}%)"
     else:
         tok = ""
     hidden = sum(1 for b in state.blocks if b.role == "thinking") + (
         1 if state.active is not None and state.active.role == "thinking" else 0
     )
     hid = f" · {hidden} thinking collapsed (ctrl+t)" if hidden and not state.show_thinking else ""
-    rows.append([(f"status: {label}{tok}{hid}", STY_STATUS)])
+    rows.append([(f"status: {label}{tok}{hid}", STY_STATUS if state.busy else state.status_style)])
 
     # Input block: one row per line (long lines wrap), "> " on the first,
     # indented after; the block's last row is the screen bottom. The
@@ -379,12 +395,25 @@ def apply_event(state: UIState, event) -> None:
         case Token(_, role, text, chunk):
             apply_token(state, role, text, chunk)
         case Error(_, text):
+            # Errors live on the status line (persistent, can't scroll away); full detail is in agent1.log.
             _finalize_active(state)
-            state.blocks.append(Block("error", "ERROR: ", text, STY_ERROR))
+            state.status = text
+            state.status_style = STY_ERROR
         case TurnDone(_):
             _finalize_active(state)
             state.busy = False
             state.status = "ready"
+            state.status_style = STY_STATUS
+        case ServerStatus(connected):
+            if connected:
+                state.status, state.status_style = "ready", STY_STATUS
+            else:
+                state.status, state.status_style = "waiting for model server...", STY_WARN
+        case CompactionDone(_, tokens_after):
+            # Posted after TurnDone so this survives the "ready" reset; next turn's TurnDone clears it.
+            state.tokens = tokens_after
+            state.status = f"compacted → {tokens_after} tokens"
+            state.status_style = STY_STATUS
         case UsageReport(_, data):
             state.tokens = int(data.get("prompt_tokens", 0)) + int(data.get("completion_tokens", 0))
         case History(messages):
@@ -438,10 +467,12 @@ def _curses_setup() -> "curses._CursesWindow":
                 # bold green: UI chrome, distinct from the cyan "You:" text.
                 STY_STATUS: curses.A_BOLD | curses.color_pair(4),
                 STY_ERROR: curses.A_BOLD | curses.color_pair(5),
+                # plain yellow (the bold yellow pair is taken by info)
+                STY_WARN: curses.color_pair(3),
             }
         )
     except curses.error:
-        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD})
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD, STY_WARN: 0})
     # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
     # our decoder instead of raising SIGINT. Input is read from stdin directly;
     # getch is never used.
@@ -653,7 +684,7 @@ def _render(stdscr, state: UIState) -> None:
         pass
 
 
-async def run(bus: Bus, context_size: int = 0) -> None:
+async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> None:
     """Run the curses UI until cancelled or quit.
 
     All curses I/O happens on the event-loop thread; key input is read raw

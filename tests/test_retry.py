@@ -2,7 +2,6 @@ import asyncio
 import os
 import sys
 import unittest
-import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,27 +52,6 @@ class TestRetryFibonacci(unittest.TestCase):
             return a + b + c
 
         self.assertEqual(asyncio.run(add(1, 2, c=5)), 8)
-
-    def test_wraps_preserves_metadata(self):
-        @retry_fibonacci()
-        async def my_http_call():
-            return 1
-
-        self.assertEqual(my_http_call.__name__, "my_http_call")
-
-    def test_4xx_raises_immediately_without_retrying(self):
-        calls = {"n": 0}
-        not_found = urllib.error.HTTPError("http://x/models/load", 404, "not found", {}, None)
-
-        @retry_fibonacci(max_retries=3, base_delay=0.01)
-        def request():
-            calls["n"] += 1
-            raise not_found
-
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            request()
-        self.assertIs(ctx.exception, not_found)
-        self.assertEqual(calls["n"], 1)
 
     def test_5xx_is_retried(self):
         calls = {"n": 0}

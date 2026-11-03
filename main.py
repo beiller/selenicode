@@ -10,8 +10,8 @@ import os
 import pathlib
 import random
 import string
-import subprocess
 import sys
+import threading
 import types
 import urllib.request
 from datetime import datetime
@@ -71,18 +71,36 @@ from tools import (
 )
 
 CURRENT_MODEL = os.environ.get("CURRENT_MODEL", "Qwen_Qwen3.5-27B-Q4_1")
-CONTEXT_SIZE = 16384
+# Context size is mandatory and only ever taken from the server; None until resolved.
+CONTEXT_SIZE: int | None = None
+ctx_ready = asyncio.Event()
+shutdown = asyncio.Event()
 
 
-def is_llama_running(base_url: str) -> bool:
-    """Check if llama-server is already running by making a request to the API."""
-    try:
-        import urllib.request
+async def _run_daemon(fn, *args):
+    """Run blocking fn in a daemon thread; cancelling the awaiter never waits for the work to finish."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
 
-        response = urllib.request.urlopen(f"{base_url}/v1/models", timeout=2)
-        return response.status == 200
-    except Exception:
-        return False
+    def runner():
+        try:
+            result = fn(*args)
+        except BaseException as e:
+            exc, res = e, None
+        else:
+            exc, res = None, result
+        if fut.done():
+            return
+        try:
+            if exc is not None:
+                loop.call_soon_threadsafe(fut.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(fut.set_result, res)
+        except Exception:
+            pass  # event loop already closed (awaiter was cancelled and moved on)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return await fut
 
 
 def load_model_and_set(model_name: str):
@@ -94,43 +112,85 @@ def load_model_and_set(model_name: str):
     CURRENT_MODEL = model_name
 
 
-@retry_fibonacci()
-def _fetch_models(base_url: str) -> list[dict]:
-    """Fetch the model list from the server (one HTTP request, retried on failure)."""
+def _fetch_models_once(base_url: str) -> list[dict]:
+    """Single-attempt fetch of the model list (the retry loop lives in wait_for_context_size)."""
     req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode("utf-8")).get("data", [])
 
 
-def get_context_size() -> int:
-    """Get the context size from llama-server or vLLM."""
-    base_url = os.getenv("LLAMA_BASE_URL")
-    context_size = int(os.environ.get("CTX_SIZE") or "16384")
-    try:
-        models = _fetch_models(base_url)
-        for preferred in (True, False):
-            for model in models:
-                if preferred and model.get("id") != CURRENT_MODEL:
-                    continue
-                # llama.cpp: nested under "meta"; vLLM: top-level field
-                n_ctx = (model.get("meta") or {}).get("n_ctx", 0) or model.get("max_model_len", 0)
-                if n_ctx > 0:
-                    context_size = n_ctx
-                    break
-            else:
+def _parse_context_size(models: list[dict]) -> int | None:
+    """Extract the context size from a /v1/models response (llama.cpp meta.n_ctx or vLLM max_model_len)."""
+    for preferred in (True, False):
+        for model in models:
+            if preferred and model.get("id") != CURRENT_MODEL:
                 continue
-            break
-    except Exception:
-        logger.warning(f"Could not read a context size, returning default of {context_size}")
-    logger.info(f"Context size: {context_size}")
-    return context_size
+            n_ctx = (model.get("meta") or {}).get("n_ctx", 0) or model.get("max_model_len", 0)
+            if n_ctx > 0:
+                return int(n_ctx)
+    return None
+
+
+async def wait_for_context_size() -> None:
+    """Keep trying to get the context size from the server until it succeeds; never gives up.
+
+    Every failed attempt surfaces an error to the user with the next retry delay (capped Fibonacci)."""
+    global CONTEXT_SIZE
+    base_url = os.getenv("LLAMA_BASE_URL")
+    bus.outbound.put_nowait(ServerStatus(False))
+    attempt = 0
+    delay_a, delay_b = 1.0, 1.0
+    while CONTEXT_SIZE is None:
+        if shutdown.is_set():
+            return
+        attempt += 1
+        try:
+            models = await _run_daemon(_fetch_models_once, base_url)
+            n_ctx = _parse_context_size(models)
+            if n_ctx is None:
+                raise RuntimeError(f"No context size in model list for {CURRENT_MODEL}")
+            CONTEXT_SIZE = n_ctx
+        except Exception as e:
+            logger.warning(f"Context size check failed (attempt {attempt}): {e!r}; retrying in {delay_a:.0f}s")
+            report_error("", f"Model server connection failed (attempt {attempt}): {e} - retrying in {delay_a:.0f}s")
+            await asyncio.sleep(delay_a)
+            delay_a, delay_b = min(delay_b, 60.0), min(delay_a + delay_b, 60.0)
+            continue
+        trigger = compaction_trigger(CONTEXT_SIZE)
+        target = compaction_target(CONTEXT_SIZE)
+        logger.info(f"Context size: {CONTEXT_SIZE}; auto-trigger at {trigger} tokens, shrink-to target {target} tokens")
+        if target >= trigger:
+            logger.warning("Shrink-to target is not below the auto-trigger; auto-compaction will be a no-op")
+        bus.outbound.put_nowait(ServerStatus(True))
+        ctx_ready.set()
+
+
+async def startup_load_model() -> None:
+    """Load the model in the background; management endpoints may not exist (e.g. vLLM)."""
+    logger.info(f"Loading model {CURRENT_MODEL}")
+    try:
+        await _run_daemon(load_model_and_set, CURRENT_MODEL)
+    except Exception as e:
+        logger.error(f"Model load at startup failed: {e!r}; continuing")
 
 
 # ---------------------------------------------------------------------------
 # Types – Chat Completions API
 # ---------------------------------------------------------------------------
 
-from bus import Bus, Error, History, Interrupt, Shutdown, Token, TurnDone, UsageReport, UserMessage
+from bus import (
+    Bus,
+    CompactionDone,
+    Error,
+    History,
+    Interrupt,
+    ServerStatus,
+    Shutdown,
+    Token,
+    TurnDone,
+    UsageReport,
+    UserMessage,
+)
 from compaction import compact_messages, compaction_target, compaction_trigger, context_token_count
 from conversation import (
     approximate_token_count,
@@ -511,6 +571,7 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
             if size > CONTEXT_SIZE:
                 report_error(user_id, f"Compaction insufficient mid-loop: {size} tokens > {CONTEXT_SIZE}, stopping turn")
                 return ""
+            bus.outbound.put_nowait(CompactionDone(user_id, size))
 
         tools, registry = get_tools()
         chunks = stream_chat_completion(base_url, messages, tools, session_id, user_id)
@@ -557,6 +618,7 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
 
 async def handle_message(user_input: str, base_url: str, user_id: UserID, session_id: SessionID, msg_id: str) -> None:
     """Handle a user message event: append it, run the tool loop, emit the reply."""
+    compacted_size: int | None = None
     try:
         messages = get_user_messages(user_id)
         # Add timestamp when user types the message
@@ -575,10 +637,13 @@ async def handle_message(user_input: str, base_url: str, user_id: UserID, sessio
                 report_error(user_id, f"Compaction failed; context still {size} tokens")
             else:
                 logger.info(f"Context size is {size} of {CONTEXT_SIZE}")
+                compacted_size = size
 
         write_conversation(session_id, messages)
     finally:
         bus.outbound.put_nowait(TurnDone(msg_id))
+        if compacted_size is not None:
+            bus.outbound.put_nowait(CompactionDone(user_id, compacted_size))
 
 
 # ---------------------------------------------------------------------------
@@ -646,52 +711,6 @@ async def compact_session(user_id: UserID = "", session_id: SessionID = ""):
     return json.dumps({"status": f"Compaction complete. Context size is {size} of {CONTEXT_SIZE}"})
 
 
-async def main_init() -> None:
-    global CONTEXT_SIZE
-    """Start llama-server if needed, load the model, and read the context size."""
-    # Load from environment variables if not provided
-    base_url = os.getenv("LLAMA_BASE_URL")
-
-    # Run llama.sh before starting the main server loop
-    # Check if llama-server is already running
-    global llama_proc
-    llama_proc = None
-
-    if is_llama_running(base_url):
-        logger.info("llama-server is already running, skipping start")
-    else:
-        # Try starting llama-server in background with fallback to setup.sh
-        logger.info("Attempting to start llama-server via start_llama.sh...")
-        llama_proc = subprocess.Popen(
-            "./start_llama.sh", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
-        )
-        await asyncio.sleep(2)  # Wait briefly for it to start/fail without blocking
-        if llama_proc.poll() is None:
-            logger.info("start_llama.sh started successfully")
-        else:
-            logger.warning(f"start_llama.sh exited with code {llama_proc.returncode}, trying setup.sh once...")
-            subprocess.run(["./setup.sh"], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # messages: list[Message] = []
-
-    # emit("info", f"Chat (Ctrl-C to cancel, twice to quit) - URL: {base_url}")
-
-    logger.info(f"Loading model {CURRENT_MODEL}")
-    try:
-        load_model_and_set(CURRENT_MODEL)
-    except Exception as e:
-        # Management endpoints may not exist (e.g. vLLM); the server may already be serving the model.
-        logger.error(f"Model load at startup failed: {e!r}; continuing")
-    CONTEXT_SIZE = get_context_size()
-    trigger = compaction_trigger(CONTEXT_SIZE)
-    target = compaction_target(CONTEXT_SIZE)
-    logger.info(f"Compaction: auto-trigger at {trigger} tokens, shrink-to target {target} tokens")
-    if target >= trigger:
-        logger.warning("Shrink-to target is not below the auto-trigger; auto-compaction will be a no-op")
-
-    await asyncio.sleep(3)
-
-
 async def main(resume: bool = False, session_id: str | None = None) -> None:
     base_url = os.getenv("LLAMA_BASE_URL")
     session_resumed = False
@@ -706,6 +725,9 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                     continue
                 case UserMessage(user_id, text, msg_id):
                     bus.interrupted.discard(user_id)  # a stale interrupt must not cancel the new turn
+                    if CONTEXT_SIZE is None:
+                        emit(user_id, "info", "Waiting for model server - context size not yet determined")
+                        await ctx_ready.wait()
 
                     # load the conversation up once hacky TODO
                     if resume and not session_resumed:
@@ -725,9 +747,11 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
                             continue
                         if "error" in result:
                             report_error(user_id, result["error"])
+                            bus.outbound.put_nowait(TurnDone(msg_id))
                         else:
-                            emit(user_id, "info", result["status"])
-                        bus.outbound.put_nowait(TurnDone(msg_id))
+                            # Posted after TurnDone so the status line keeps the message (TurnDone resets it to "ready").
+                            bus.outbound.put_nowait(TurnDone(msg_id))
+                            bus.outbound.put_nowait(CompactionDone(user_id, context_token_count(get_user_messages(user_id))))
                         continue
                     try:
                         await handle_message(text, base_url, user_id, session_id, msg_id)
@@ -743,17 +767,6 @@ async def main(resume: bool = False, session_id: str | None = None) -> None:
     except Exception as e:
         logger.error(f"Main loop error: {e}")
         raise
-    finally:
-        if llama_proc is not None:
-            try:
-                llama_proc.terminate()
-                try:
-                    llama_proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    llama_proc.kill()
-                logger.info("llama-server stopped")
-            except Exception as e:
-                logger.error(f"Stopping llama-server: {e}")
 
 
 CLIENTS = {
@@ -783,7 +796,6 @@ async def async_main(client_type: str, session_id: str | None = None):
         session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
     bus.bind()
-    await main_init()
 
     if resume and client_type == "terminal":
         try:
@@ -791,15 +803,19 @@ async def async_main(client_type: str, session_id: str | None = None):
         except (OSError, ValueError) as e:
             logger.warning(f"Could not load history for session {session_id}: {e}")
 
-    init_task = asyncio.create_task(client.run(bus, CONTEXT_SIZE))
+    # Server-dependent work runs in the background; the UI comes up immediately.
+    load_task = asyncio.create_task(startup_load_model())
+    ctx_task = asyncio.create_task(wait_for_context_size())
+    init_task = asyncio.create_task(client.run(bus, lambda: CONTEXT_SIZE))
     main_task = asyncio.create_task(main(resume=resume, session_id=session_id))
     try:
         await asyncio.wait({init_task, main_task}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (init_task, main_task):
+        shutdown.set()  # stop background workers from starting new attempts
+        for task in (load_task, ctx_task, init_task, main_task):
             task.cancel()
         try:
-            await asyncio.gather(init_task, main_task, return_exceptions=True)
+            await asyncio.gather(load_task, ctx_task, init_task, main_task, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Cancelled during cleanup")
         try:

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 import discord
 from discord.ext import commands
@@ -128,7 +128,7 @@ class DiscordClient(commands.Bot):
             _bus.post(UserMessage(user_id, message.content, uuid.uuid4().hex[:8]))
 
 
-async def run(bus: Bus, context_size: int = 0) -> None:
+async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> None:
     """Run the Discord bot and the outbound consumer until cancelled."""
     global client, _bus
     _bus = bus

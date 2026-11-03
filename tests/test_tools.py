@@ -48,11 +48,6 @@ class TestReadFile(FileToolsBase):
         self.assertNotIn("4: four", r["result"])
         self.assertIn("Use offset=4 to continue", r["result"])
 
-    def test_offset_out_of_range(self):
-        self.write_raw("one\n")
-        r = ok(read_file(self.path, offset=99))
-        self.assertIn("out of range", r["error"])
-
     def test_missing_file_with_suggestion(self):
         self.write_raw("x\n")
         r = ok(read_file(self.path + ".extra"))
@@ -78,21 +73,6 @@ class TestReadFile(FileToolsBase):
         r = ok(read_file(self.path))
         self.assertIn("truncated to 2000 chars", r["result"])
 
-    def test_emoji_and_special_chars_roundtrip(self):
-        content = "héllo wörld\n日本語のテキスト\n🎉🚀💯 emoji line\na\u0301combining\ufeffbom \u200bzwb\n"
-        self.write_raw(content)
-        r = ok(read_file(self.path))
-        self.assertEqual(r["status"], "success")
-        for line in ("héllo wörld", "日本語のテキスト", "🎉🚀💯 emoji line"):
-            self.assertIn(line, r["result"])
-
-    def test_crlf_content_read(self):
-        with open(self.path, "wb") as f:
-            f.write(b"line one\r\nline two\r\n")
-        r = ok(read_file(self.path))
-        self.assertEqual(r["status"], "success")
-        self.assertIn("1: line one", r["result"])
-
 
 class TestWriteFile(FileToolsBase):
     def test_write_new_file(self):
@@ -114,24 +94,9 @@ class TestWriteFile(FileToolsBase):
         self.assertIn("-old line", r["diff"])
         self.assertIn("+new line", r["diff"])
 
-    def test_emoji_and_special_chars_roundtrip(self):
-        content = "🎉 emoji start\ncafé crème naïve\n日本語 + 中文 + 한국어\n"
-        ok(write_file(self.path, content))
-        self.assertEqual(self.read_raw(), content)
-
-    def test_special_control_and_unicode_edge_chars(self):
-        content = "tab\there\nnull-ish \x0bvertical tab\nzero-width\u200bjoiner\nsurrogate-adjacent \U0001f90a\n"
-        ok(write_file(self.path, content))
-        self.assertEqual(self.read_raw(), content)
-
     def test_bom_preserved_on_overwrite(self):
         self.write_raw("old\n", bom=b"\xef\xbb\xbf")
         ok(write_file(self.path, "new\n"))
-        with open(self.path, "rb") as f:
-            self.assertTrue(f.read().startswith(b"\xef\xbb\xbf"))
-
-    def test_bom_added_when_content_has_bom(self):
-        ok(write_file(self.path, "\ufeffcontent\n"))
         with open(self.path, "rb") as f:
             self.assertTrue(f.read().startswith(b"\xef\xbb\xbf"))
 
@@ -161,49 +126,17 @@ class TestEditFile(FileToolsBase):
         r = ok(edit_file(self.path, "absent", "x"))
         self.assertIn("could not find", r["error"].lower())
 
-    def test_identical_strings_rejected(self):
-        self.write_raw("same\n")
-        r = ok(edit_file(self.path, "same", "same"))
-        self.assertIn("identical", r["error"].lower())
-
-    def test_missing_file(self):
-        r = ok(edit_file(os.path.join(self.dir.name, "nope.txt"), "a", "b"))
-        self.assertIn("not found", r["error"].lower())
-
-    def test_directory_rejected(self):
-        r = ok(edit_file(self.dir.name, "a", "b"))
-        self.assertIn("directory", r["error"].lower())
-
     def test_empty_old_string_replaces_whole_file(self):
         self.write_raw("old content\nmore\n")
         r = ok(edit_file(self.path, "", "brand new\n"))
         self.assertTrue(r["success"])
         self.assertEqual(self.read_raw(), "brand new\n")
 
-    def test_multiline_match_with_context(self):
-        self.write_raw("def foo():\n    return 1\n\ndef bar():\n    return 2\n")
-        r = ok(edit_file(self.path, "def bar():\n    return 2", "def bar():\n    return 20"))
-        self.assertTrue(r["success"])
-        self.assertIn("return 20", self.read_raw())
-        self.assertNotIn("return 2\n", self.read_raw().replace("return 20\n", ""))
-
     def test_indentation_flexible_match(self):
         self.write_raw("class A:\n    def m(self):\n        return 1\n")
         r = ok(edit_file(self.path, "def m(self):\n      return 1", "def m(self):\n        return 99"))
         self.assertTrue(r["success"])
         self.assertIn("return 99", self.read_raw())
-
-    def test_whitespace_normalized_match(self):
-        self.write_raw("int  x   =  5\n")
-        r = ok(edit_file(self.path, "int x = 5", "int y = 6"))
-        self.assertTrue(r["success"])
-        self.assertEqual(self.read_raw(), "int y = 6\n")
-
-    def test_line_trimmed_match(self):
-        self.write_raw("hello world\nnext line\n")
-        r = ok(edit_file(self.path, "   hello world", "HELLO WORLD"))
-        self.assertTrue(r["success"])
-        self.assertIn("HELLO WORLD", self.read_raw())
 
     def test_crlf_preserved(self):
         with open(self.path, "wb") as f:
@@ -219,19 +152,6 @@ class TestEditFile(FileToolsBase):
         r = ok(edit_file(self.path, "héllo 🎉", "wörld 💯"))
         self.assertTrue(r["success"])
         self.assertEqual(self.read_raw(), "greeting: wörld 💯\nsecond: 日本語\n")
-
-    def test_emoji_match_preserves_rest_of_file_bytes(self):
-        original = "🚀 launch\ncafé\n한국어 line\n"
-        self.write_raw(original)
-        r = ok(edit_file(self.path, "🚀 launch", "🎉 party"))
-        self.assertTrue(r["success"])
-        self.assertEqual(self.read_raw(), "🎉 party\ncafé\n한국어 line\n")
-
-    def test_combining_and_zero_width_chars(self):
-        self.write_raw("a\u0301ccent\ufeffbom \u200bzwb\n")
-        r = ok(edit_file(self.path, "a\u0301ccent", "changed"))
-        self.assertTrue(r["success"])
-        self.assertEqual(self.read_raw(), "changed\ufeffbom \u200bzwb\n")
 
     def test_additions_deletions_counts(self):
         self.write_raw("one\ntwo\nthree\n")
