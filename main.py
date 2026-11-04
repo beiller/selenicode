@@ -22,7 +22,7 @@ import aiohttp
 
 from core import config
 
-LOG_FILE = config.ROOT_DIR / "agent1.log"
+LOG_FILE = config.DATA_DIR / "agent1.log"
 
 # File-only logging: a console handler would write raw text over the terminal
 # client's screen. Everything lands in agent1.log (rotating).

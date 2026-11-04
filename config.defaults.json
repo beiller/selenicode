@@ -6,7 +6,7 @@
         "model": ""
     },
     "compaction": {
-        "tail_turns": 10,
+        "tail_turns": 16,
         "trigger_pct": 80.0,
         "target_pct": 30.0
     },

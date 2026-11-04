@@ -20,12 +20,19 @@ def _find_root() -> pathlib.Path:
 
 ROOT_DIR = _find_root()
 
+# Per-user data (log, conversations, fallback config) — never inside the package.
+DATA_DIR = pathlib.Path.home() / ".selenicode"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _load() -> dict:
-    """Built-ins <- config.defaults.json (repo) <- config.json (local, wins)."""
+    """Built-ins <- config.defaults.json (repo) <- ~/.selenicode/config.json <- config.json (local, wins)."""
     data = json.loads(json.dumps(_DEFAULTS))
-    for name in ("config.defaults.json", "config.json"):
-        path = ROOT_DIR / name
+    candidates = [ROOT_DIR / "config.defaults.json"]
+    if DATA_DIR != ROOT_DIR:
+        candidates.append(DATA_DIR / "config.json")
+    candidates.append(ROOT_DIR / "config.json")
+    for path in candidates:
         if path.exists():
             with open(path) as fh:
                 user = json.load(fh)

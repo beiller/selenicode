@@ -3,9 +3,9 @@ import re
 import sqlite3
 import sys
 
-from core.config import ROOT_DIR
+from core.config import DATA_DIR
 
-CONVERSATIONS_DIR = ROOT_DIR / "conversations"
+CONVERSATIONS_DIR = DATA_DIR / "conversations"
 DB = CONVERSATIONS_DIR / "conversations.db"
 DIR = CONVERSATIONS_DIR
 CONTEXT_CHARS = 1000

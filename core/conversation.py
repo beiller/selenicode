@@ -2,10 +2,11 @@ import json
 from datetime import datetime
 from typing import List
 
-from core.config import ROOT_DIR
+from core.config import DATA_DIR
 from core.main_types import Message, SessionID
 
-CONVERSATION_DIR = ROOT_DIR / "conversations"
+CONVERSATION_DIR = DATA_DIR / "conversations"
+CONVERSATION_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def approximate_token_count(text: str) -> int:
@@ -42,7 +43,6 @@ def archive_conversation(session_id: str, messages: List[Message]) -> str:
 
 
 def write_conversation(session_id: str, messages: List[Message]) -> None:
-    CONVERSATION_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONVERSATION_DIR / f"{session_id}.json", "w") as fh:
         json.dump(messages, fh)
 

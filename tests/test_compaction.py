@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import pathlib
 import sys
 import unittest
 from unittest import mock
@@ -10,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import compaction, config
 
-REAL_CONVERSATION = pathlib.Path(__file__).parent.parent / "conversations" / "bakupte6.json"
+REAL_CONVERSATION = config.DATA_DIR / "conversations" / "bakupte6.json"
 
 
 class CompactionBase(unittest.TestCase):
