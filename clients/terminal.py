@@ -646,7 +646,7 @@ def _finalize_active(state: UIState) -> None:
     state.active = None
 
 
-def apply_token(state: UIState, role: str, text: str, chunk: bool) -> None:
+def apply_token(state: UIState, role: str, text: str, chunk: bool, extra: dict | None = None) -> None:
     """Feed one outbound Token event into the state."""
     if chunk:
         if state.active is None or state.active.role != role:
@@ -656,9 +656,10 @@ def apply_token(state: UIState, role: str, text: str, chunk: bool) -> None:
             state.active = Block(role, prefix, "", style)
         state.active.raw += text
     elif text:
-        # one-shot status line (tool call, info, error)
+        # one-shot status line (tool call, info, error); tool calls carry
+        # structured args so file-mutating ones render as diffs
         _finalize_active(state)
-        state.blocks.append(Block(role, "", text, _ROLE_STYLE.get(role, STY_INFO)))
+        state.blocks.append(Block(role, "", text, _ROLE_STYLE.get(role, STY_INFO), extra if role == "tool" else None))
     else:
         # per-LLM-call end marker
         _finalize_active(state)
@@ -1060,8 +1061,8 @@ def blocks_from_history(messages: list[dict]) -> list[Block]:
 def apply_event(state: UIState, event) -> None:
     """Feed one outbound bus event into the state."""
     match event:
-        case Token(_, role, text, chunk):
-            apply_token(state, role, text, chunk)
+        case Token(_, role, text, chunk, extra):
+            apply_token(state, role, text, chunk, extra)
         case Error(_, text):
             # Errors live on the status line (persistent, can't scroll away); full detail is in agent1.log.
             _finalize_active(state)

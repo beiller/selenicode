@@ -35,6 +35,7 @@ class Token:
     role: str
     text: str
     chunk: bool = True
+    extra: dict | None = None  # structured payload (e.g. tool-call args for diff rendering)
 
 
 @dataclass(frozen=True)

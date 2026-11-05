@@ -933,6 +933,15 @@ class TestToolDiff(unittest.TestCase):
         lines = t2._block_lines(state, b, 60)
         self.assertEqual(lines[0], [("read_file(path='a.py')", t2.STY_TOOL)])
 
+    def test_oneshot_tool_token_renders_diff(self):
+        state = t2.UIState()
+        t2.apply_event(state, Token("0", "tool", "edit_file(...)", False, {"name": "edit_file", "args": {"file_path": "a.py", "old_string": "x\ny", "new_string": "x\nZ"}}))
+        b = state.blocks[-1]
+        self.assertEqual(b.extra["name"], "edit_file")
+        lines = t2._block_lines(state, b, 60)
+        self.assertEqual(lines[0], [("edit_file a.py", self.T)])
+        self.assertIn([("+ Z", self.A)], lines)
+
 
 class TestCellLen(unittest.TestCase):
     def test_cell_widths(self):

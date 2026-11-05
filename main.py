@@ -560,8 +560,8 @@ async def consume_stream(
 # ---------------------------------------------------------------------------
 
 
-def emit(user_id: UserID, role: str, content: str, chunk: bool = False) -> None:
-    bus.outbound.put_nowait(Token(user_id, role, content, chunk))
+def emit(user_id: UserID, role: str, content: str, chunk: bool = False, extra: dict | None = None) -> None:
+    bus.outbound.put_nowait(Token(user_id, role, content, chunk, extra))
 
 
 def report_error(user_id: UserID, message: str, exc: BaseException | None = None) -> None:
@@ -594,7 +594,7 @@ async def execute_tool_calls(
             args_short = ", ".join(f"{k}={v!r}" for k, v in args.items())
             if len(args_short) > 200:
                 args_short = args_short[0:200] + "..."
-            emit(user_id, "tool", f"{name}({args_short})")
+            emit(user_id, "tool", f"{name}({args_short})", extra={"name": name, "args": args})
             try:
                 if inspect.iscoroutinefunction(handler):
                     output = await handler(**args)

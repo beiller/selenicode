@@ -46,6 +46,25 @@ class TestExecuteToolCalls(unittest.TestCase):
         self.assertEqual(results[1]["role"], "tool")
         self.assertEqual(results[1]["content"], "async-hi")
 
+    def test_tool_call_emit_carries_args_for_diff(self):
+        def edit_file(file_path: str = "", old_string: str = "", new_string: str = "") -> str:
+            return "ok"
+
+        b = bus_mod.Bus()
+        with mock.patch.object(main, "bus", b):
+            asyncio.run(
+                main.execute_tool_calls(
+                    make_assistant_msg("edit_file", '{"file_path": "a.py", "old_string": "x\\ny", "new_string": "x\\nZ"}'),
+                    {"edit_file": edit_file},
+                    "user1",
+                )
+            )
+        ev = b.outbound.get_nowait()
+        self.assertIsInstance(ev, bus_mod.Token)
+        self.assertEqual(ev.role, "tool")
+        self.assertEqual(ev.extra["name"], "edit_file")
+        self.assertEqual(ev.extra["args"]["new_string"], "x\nZ")
+
     def test_compact_session_is_registered(self):
         tools, registry = main.build_tools()
         names = [t["function"]["name"] for t in tools]

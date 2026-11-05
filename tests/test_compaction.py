@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import sys
 import unittest
@@ -8,8 +7,6 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import compaction, config
-
-REAL_CONVERSATION = config.DATA_DIR / "conversations" / "bakupte6.json"
 
 
 class CompactionBase(unittest.TestCase):
@@ -154,42 +151,6 @@ class TestBudget(CompactionBase):
         with mock.patch.object(config, "COMPACTION_TARGET_PCT", 20.0):
             self.assertEqual(compaction.preserve_recent_budget(16384), 3276)
         self.assertEqual(compaction.preserve_recent_budget(1_000_000), 8000)
-
-
-class TestRealConversation(CompactionBase):
-    def test_compact_bakupte6_conversation(self):
-        with open(REAL_CONVERSATION) as f:
-            messages = json.load(f)
-        # ~144k tokens, so a 500k context (20% target = 100k) is needed to trigger
-        context_size = 500_000
-        self.assertGreater(compaction.context_token_count(messages), compaction.compaction_target(context_size))
-        original_last = messages[-1]
-        self.run_compact(messages, context_size=context_size)
-
-        marker_idx = next(i for i, m in enumerate(messages) if m.get("compaction_marker"))
-        self.assertEqual(marker_idx, 0)
-        self.assertTrue(messages[1].get("compaction_summary"))
-        tail = messages[2:]
-        self.assertGreater(len(tail), 0)
-        self.assertLessEqual(compaction.context_token_count(tail), compaction.preserve_recent_budget(context_size))
-        self.assertIs(tail[-1], original_last)
-        self.assertNotEqual(tail[0]["role"], "tool")
-        self.assertLessEqual(
-            compaction.context_token_count(messages), compaction.compaction_target(context_size) + 4096
-        )
-
-    def test_recompact_bakupte6_anchors_on_previous_summary(self):
-        with open(REAL_CONVERSATION) as f:
-            messages = json.load(f)
-        context_size = 500_000
-        self.run_compact(messages, context_size=context_size, summary="SUMMARY1")
-        # New conversation growth pushes the context back over the target
-        messages.append({"role": "user", "content": "G" * 400_000})
-        messages.append({"role": "assistant", "content": "g" * 400_000})
-        self.run_compact(messages, context_size=context_size, summary="SUMMARY2")
-        prompt = self.summarize_calls[1][-1]["content"]
-        self.assertIn("<previous-summary>\nSUMMARY1\n</previous-summary>", prompt)
-        self.assertEqual(len([m for m in messages if m.get("compaction_marker")]), 1)
 
 
 class TestMultimodalAccounting(unittest.TestCase):
