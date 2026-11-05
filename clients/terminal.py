@@ -10,18 +10,25 @@ Layout (H x W):
     row   H-2       status bar (bold green): spinner/state + token usage
     row   H-1       prompt line: "> " + input + cursor
 
-Keys: Enter submit, Backspace/Left/Right edit, PgUp/PgDn/Home/End/wheel scroll,
-Ctrl+C interrupt a running turn (clears input when idle), Ctrl+Q quit.
+Keys: Enter submit, Backspace/Delete/Ctrl+Arrow/Left/Right edit, Home/End jump
+to line start/end, Up/Down recall user history (scroll when there is none),
+PgUp/PgDn scroll, Ctrl+C interrupt a running turn (clears input when idle),
+Ctrl+Q quit. Mouse: left-drag selects (highlighted); release copies the
+selection to the clipboard (local tool if installed, else OSC 52); middle-
+click pastes; wheel scrolls.
 """
 
 import asyncio
+import base64
 import curses
 import fcntl
 import json
 import logging
 import os
 import pathlib
+import shutil
 import struct
+import subprocess
 import sys
 import termios
 import textwrap
@@ -62,6 +69,9 @@ K_RIGHT = 262
 _BLOCK_GAP = 1  # blank rows between scrollback sections (thinking/message/tool)
 K_HOME = 270
 K_END = 271
+K_DELETE = 263
+K_CTRL_LEFT = 264
+K_CTRL_RIGHT = 265
 K_PPAGE = 339
 K_NPAGE = 338
 
@@ -117,6 +127,10 @@ class UIState:
         self.view_top: int | None = None
         self.input_buf = ""
         self.cursor = 0
+        self.hist_index: int | None = None  # position in _user_history while navigating
+        self.hist_stash = ""  # the buffer saved when Up started navigation
+        self.sel_anchor: tuple[int, int] | None = None  # (row, col) screen coords where the drag started
+        self.sel_extent: tuple[int, int] | None = None  # live (row, col) of the drag
         self.show_thinking = False  # ctrl+t toggles; collapsed to a placeholder line by default
         self.status = "ready"
         self.status_style = STY_STATUS
@@ -133,6 +147,35 @@ def wrap_text(text: str, width: int) -> list[str]:
     out: list[str] = []
     for para in text.split("\n"):
         out.extend(textwrap.wrap(para, max(1, width)) or [""])
+    return out
+
+
+def _first_line(para: str, w: int) -> tuple[str, str]:
+    """Split para into (line of at most w chars on a word boundary, rest)."""
+    if len(para) <= w:
+        return para, ""
+    cut = para.rfind(" ", 0, w + 1)
+    first = para[:cut].rstrip() if cut > 0 else ""
+    rest = para[cut:].lstrip() if cut > 0 else para
+    if not first:  # all-whitespace prefix or no word boundary: hard cut
+        return para[:w], para[w:]
+    return first, rest
+
+
+def _wrap_block(text: str, first_w: int, rest_w: int) -> list[str]:
+    """Wrap text; the very first line is limited to first_w chars (the block
+    prefix sits on it), all following lines to rest_w (2-cell indent)."""
+    if not text:
+        return [""]
+    out: list[str] = []
+    for i, para in enumerate(text.split("\n")):
+        if i == 0 and para:
+            first, rest = _first_line(para, first_w)
+            out.append(first)
+            if rest:
+                out.extend(textwrap.wrap(rest, max(1, rest_w)))
+        else:
+            out.extend(textwrap.wrap(para, max(1, rest_w)) or [""])
     return out
 
 
@@ -154,9 +197,13 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
         preview = " ".join(block.raw.split())
         if len(preview) > 100:
             preview = preview[:100] + "\u2026"
-        lines.append([(f"(thinking) (collapsed) {len(block.raw)} chars: {preview}", block.style)])
+        text = f"(thinking) (collapsed) {len(block.raw)} chars: {preview}"
+        for i, ln in enumerate(wrap_text(text, max(1, width - 3))):
+            lines.append([(("  " if i else "") + ln, block.style)])
     else:
-        wrapped = wrap_text(block.raw, max(1, width - 2))
+        # Usable row width is width-1 cells (the last column is reserved); the
+        # first line carries the prefix, continuation lines a 2-cell indent.
+        wrapped = _wrap_block(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
         for i, ln in enumerate(wrapped):
             if i == 0 and block.prefix:
                 lines.append([(block.prefix, block.style), (ln, block.style)])
@@ -172,7 +219,7 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
 def _input_block_rows(input_lines: list[str], width: int) -> list[list[tuple[str, int]]]:
     """Rows for the input block; long lines wrap across rows so the cursor
     never runs off the right edge ("> " on the first line, indented after)."""
-    chunk_w = max(1, width - 2)
+    chunk_w = max(1, width - 3)
     rows: list[list[tuple[str, int]]] = []
     for i, ln in enumerate(input_lines):
         chunks = [ln[j:j + chunk_w] for j in range(0, len(ln), chunk_w)] or [""]
@@ -184,7 +231,7 @@ def _input_block_rows(input_lines: list[str], width: int) -> list[list[tuple[str
 
 def _input_block_height(input_lines: list[str], width: int) -> int:
     """Rows the input block occupies (long lines wrap)."""
-    chunk_w = max(1, width - 2)
+    chunk_w = max(1, width - 3)
     return sum(max(1, (len(ln) + chunk_w - 1) // chunk_w) for ln in input_lines)
 
 
@@ -207,7 +254,7 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
     cs = state.context_size() if callable(state.context_size) else state.context_size
     if cs:
         pct = int(state.tokens * 100 / cs)
-        tok = f" tokens: {state.tokens}/{cs} ({pct}%)"
+        tok = f" · tokens: {state.tokens}/{cs} ({pct}%)"
     else:
         tok = ""
     hidden = sum(1 for b in state.blocks if b.role == "thinking") + (
@@ -221,7 +268,7 @@ def render_frame(state: UIState, height: int, width: int) -> list[list[tuple[str
     # viewport shrinks to fit.
     rows.extend(_input_block_rows(input_lines, width))
     if not state.input_buf:
-        rows[-1].append(("  ↑↓/pgup scroll · ctrl+c interrupt · ctrl+q quit · ctrl+t show thinking · /help for commands", STY_DIM))
+        rows[-1].append(("  ↑↓ history · drag copies · mid-click pastes · pgup/pgdn scroll · ctrl+c interrupt · ctrl+q quit · ctrl+t show thinking · /help for commands", STY_DIM))
     return rows
 
 
@@ -258,6 +305,45 @@ def submit_message(state: UIState, text: str) -> None:
     state.busy = True
 
 
+def _line_bounds(buf: str, cursor: int) -> tuple[int, int]:
+    """(start, end) of the line containing cursor in buf."""
+    start = buf.rfind("\n", 0, cursor) + 1
+    end = buf.find("\n", cursor)
+    return start, len(buf) if end == -1 else end
+
+
+def _user_history(state: UIState) -> list[str]:
+    """User-submitted messages in order (for Up/Down recall)."""
+    return [b.raw for b in state.blocks if b.role == "user"]
+
+
+def _end_hist_nav(state: UIState) -> None:
+    """Leave history navigation (the line was edited or cleared)."""
+    if state.hist_index is not None:
+        state.hist_index = None
+        state.hist_stash = ""
+
+
+def _word_jump(buf: str, cursor: int, forward: bool) -> int:
+    """Move to the next/previous word boundary (readline semantics)."""
+    def is_word(c: str) -> bool:
+        return c.isalnum() or c == "_"
+    n = len(buf)
+    if forward:
+        i = cursor
+        while i < n and not is_word(buf[i]):
+            i += 1
+        while i < n and is_word(buf[i]):
+            i += 1
+        return i
+    i = cursor
+    while i > 0 and not is_word(buf[i - 1]):
+        i -= 1
+    while i > 0 and is_word(buf[i - 1]):
+        i -= 1
+    return i
+
+
 def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[str, str]:
     """Apply one key event. Returns (action, payload); action is one of
     "", "submit" (payload = text), "interrupt", "quit"."""
@@ -271,6 +357,7 @@ def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[st
             return "interrupt", ""
         state.input_buf = ""
         state.cursor = 0
+        _end_hist_nav(state)
         return "", ""
     if key == K_CTRL_T:
         state.show_thinking = not state.show_thinking
@@ -279,23 +366,48 @@ def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[st
         text = state.input_buf.strip()
         state.input_buf = ""
         state.cursor = 0
+        _end_hist_nav(state)
         if not text:
             return "", ""
         return "submit", text
     if key == K_ESC:
         state.input_buf = ""
         state.cursor = 0
+        _end_hist_nav(state)
         return "", ""
     if key in (K_BACKSPACE, 8):
+        _end_hist_nav(state)
         if state.cursor > 0:
             state.input_buf = state.input_buf[: state.cursor - 1] + state.input_buf[state.cursor :]
             state.cursor -= 1
         return "", ""
     if key == K_UP:
-        _scroll(state, 3, total, view_h)
+        hist = _user_history(state)
+        if hist:
+            if state.hist_index is None:
+                state.hist_stash = state.input_buf
+                state.hist_index = len(hist) - 1
+            else:
+                state.hist_index = max(0, state.hist_index - 1)
+            state.input_buf = hist[state.hist_index]
+            state.cursor = len(state.input_buf)
+        else:
+            _scroll(state, 3, total, view_h)  # no history yet: scroll as before
         return "", ""
     if key == K_DOWN:
-        _scroll(state, -3, total, view_h)
+        hist = _user_history(state)
+        if state.hist_index is not None and hist:
+            state.hist_index += 1
+            if state.hist_index >= len(hist):
+                state.input_buf = state.hist_stash
+                state.cursor = len(state.input_buf)
+                state.hist_index = None
+                state.hist_stash = ""
+            else:
+                state.input_buf = hist[state.hist_index]
+                state.cursor = len(state.input_buf)
+        else:
+            _scroll(state, -3, total, view_h)  # not navigating: scroll as before
         return "", ""
     if key == K_LEFT:
         state.cursor = max(0, state.cursor - 1)
@@ -310,12 +422,27 @@ def apply_key(state: UIState, key, view_h: int = 24, total: int = 0) -> tuple[st
         _scroll(state, -(view_h - 1), total, view_h)
         return "", ""
     if key == K_HOME:
-        state.view_top = 0
+        state.cursor = _line_bounds(state.input_buf, state.cursor)[0]
         return "", ""
     if key == K_END:
-        state.view_top = None
+        start, end = _line_bounds(state.input_buf, state.cursor)
+        if 0 <= state.cursor < len(state.input_buf) and state.input_buf[state.cursor] == "\n":
+            end = min(len(state.input_buf), state.cursor + 1)
+        state.cursor = end
+        return "", ""
+    if key == K_CTRL_LEFT:
+        state.cursor = _word_jump(state.input_buf, state.cursor, False)
+        return "", ""
+    if key == K_CTRL_RIGHT:
+        state.cursor = _word_jump(state.input_buf, state.cursor, True)
+        return "", ""
+    if key == K_DELETE:
+        _end_hist_nav(state)
+        if state.cursor < len(state.input_buf):
+            state.input_buf = state.input_buf[: state.cursor] + state.input_buf[state.cursor + 1 :]
         return "", ""
     if 32 <= key < 127:
+        _end_hist_nav(state)
         state.input_buf = state.input_buf[: state.cursor] + chr(key) + state.input_buf[state.cursor :]
         state.cursor += 1
         return "", ""
@@ -344,12 +471,183 @@ def _scroll(state: UIState, delta: int, total: int, view_h: int) -> None:
     """Scroll the viewport; positive delta moves toward older content.
     Absolute anchor: while detached, streaming does not move the view;
     reaching the bottom re-pins (auto-follow)."""
+    _clear_selection(state)  # screen coords would drift with the content
     bottom = max(0, total - view_h)
     if state.view_top is None:
         state.view_top = bottom  # first scroll up anchors at the current bottom
     state.view_top = max(0, min(state.view_top - delta, bottom))
     if state.view_top == bottom:
         state.view_top = None
+
+
+def _clear_selection(state: UIState) -> None:
+    state.sel_anchor = None
+    state.sel_extent = None
+
+
+def _selection_range(state: UIState) -> tuple[int, int, int, int] | None:
+    """Normalized (r1, r2, c1, c2) of the active drag; None while not
+    dragging (a press alone is not a selection yet)."""
+    if state.sel_anchor is None or state.sel_extent is None:
+        return None
+    ar, ac = state.sel_anchor
+    er, ec = state.sel_extent
+    return (min(ar, er), max(ar, er), min(ac, ec), max(ac, ec))
+
+
+def _apply_mouse(state: UIState, event: str, col1: int, row1: int, height: int, width: int) -> None:
+    """Mouse event in SGR 1-based screen coords. Left press starts a
+    selection, drag extends it (highlighted by _render), release copies the
+    region to the clipboard; a click without drag cancels. Middle-button
+    press pastes the system clipboard at the cursor."""
+    col = max(0, min(col1 - 1, width - 2))
+    row = max(0, min(row1 - 1, height - 1))
+    if event == "middle":
+        _end_hist_nav(state)
+        text = _read_clipboard()
+        if text:
+            _insert_text(state, text)
+        return
+    if event == "press":
+        state.sel_anchor = (row, col)
+        state.sel_extent = None
+    elif event == "drag" and state.sel_anchor is not None:
+        state.sel_extent = (row, col)
+    elif event == "release":
+        if state.sel_anchor is not None and state.sel_extent is not None:
+            _copy_selection(state, height, width)
+        _clear_selection(state)
+
+
+def _row_cells(segs: list[tuple[str, int]], width: int) -> list[tuple[int, str]]:
+    """(start_col, char) of the visible cells of a row, clipped exactly like
+    _render (last column reserved; a wide char straddling the edge drops)."""
+    out: list[tuple[int, str]] = []
+    col = 0
+    for text, _ in segs:
+        if col >= width - 1 or not text:
+            continue
+        for ch in text:
+            wch = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if col + wch > width - 1:
+                break
+            out.append((col, ch))
+            col += wch
+    return out
+
+
+def _cells_slice(cells: list[tuple[int, str]], c1: int, c2: int) -> str:
+    """Chars whose cells overlap [c1, c2); a wide char is included whole when
+    a boundary lands on it."""
+    out: list[str] = []
+    for start, ch in cells:
+        end = start + (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if (c1 <= start < c2) or (start < c1 < end):
+            out.append(ch)
+    return "".join(out)
+
+
+def _sel_row_bounds(state: UIState, r: int) -> tuple[int, int] | None:
+    """(c1, c2) of the selection on screen row r; None when the row is not
+    selected. Line-aware (terminal/tmux semantics): a multi-line drag selects
+    the top line from its column to end-of-line, the bottom line from
+    start-of-line to its column, and middle lines in full."""
+    if state.sel_anchor is None or state.sel_extent is None:
+        return None
+    ar, ac = state.sel_anchor
+    er, ec = state.sel_extent
+    r1, r2 = min(ar, er), max(ar, er)
+    if r < r1 or r > r2:
+        return None
+    if r1 == r2:
+        return (min(ac, ec), max(ac, ec))
+    top_col = ac if ar == r1 else ec
+    bot_col = ec if er == r2 else ac
+    if r == r1:
+        return (top_col, 9999)
+    if r == r2:
+        return (0, bot_col)
+    return (0, 9999)
+
+
+def _extract_selection(state: UIState, height: int, width: int) -> str:
+    """Text of the selected screen region using line-aware semantics (see
+    _sel_row_bounds); lines are joined with newlines."""
+    if state.sel_anchor is None or state.sel_extent is None:
+        return ""
+    r1 = min(state.sel_anchor[0], state.sel_extent[0])
+    r2 = max(state.sel_anchor[0], state.sel_extent[0])
+    rows = render_frame(state, height, width)[:height]
+    lines: list[str] = []
+    for r in range(r1, r2 + 1):
+        cells = _row_cells(rows[r], width) if r < len(rows) else []
+        c1, c2 = _sel_row_bounds(state, r)
+        lines.append(_cells_slice(cells, c1, c2).rstrip())
+    return "\n".join(lines)
+
+
+def _copy_osc52(text: str) -> str:
+    """OSC 52 clipboard-write sequence (the tmux approach); terminals that
+    restrict writes simply ignore it, so this can silently no-op."""
+    return f"\x1b]52;c;{base64.b64encode(text.encode('utf-8')).decode('ascii')}\x1b\\"
+
+
+_CLIP_CMDS: list[list[str]] = []  # set once at startup by _pick_clipboard_cmds
+_CLIP_READ_CMDS: list[list[str]] = []  # set once at startup by _pick_clipboard_read_cmds
+
+
+def _pick_clipboard_cmds() -> list[list[str]]:
+    """All installed local clipboard tools (each reads the text from stdin),
+    in preference order. A session may only support some of them (e.g. an X11
+    session with wl-clipboard installed), so copying tries each in turn."""
+    candidates = (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard"], ["pbcopy"])
+    return [cmd for cmd in candidates if shutil.which(cmd[0])]
+
+
+def _pick_clipboard_read_cmds() -> list[list[str]]:
+    """All installed local tools that print the clipboard to stdout (for
+    middle-click paste), in preference order."""
+    candidates = (["wl-paste"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard"], ["pbpaste"])
+    return [cmd for cmd in candidates if shutil.which(cmd[0])]
+
+
+def _read_clipboard() -> str | None:
+    """Read the system clipboard via the first tool that succeeds."""
+    for cmd in _CLIP_READ_CMDS:
+        try:
+            proc = subprocess.run(cmd, timeout=1, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout.decode("utf-8", "replace")
+        except Exception:
+            pass
+    return None
+
+
+def _copy_via_tool(text: str) -> bool:
+    """Write text to the clipboard via the first tool that succeeds."""
+    for cmd in _CLIP_CMDS:
+        try:
+            proc = subprocess.run(cmd, input=text.encode("utf-8"), timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if proc.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _copy_selection(state: UIState, height: int, width: int) -> str | None:
+    """Copy the active selection and note it in the status bar; returns the
+    copied text (None when there was nothing to copy). Prefers a local
+    clipboard tool (reliable where terminals restrict OSC 52 writes, e.g.
+    GNOME Terminal), falling back to OSC 52."""
+    text = _extract_selection(state, height, width)
+    if not text:
+        return None
+    if not _copy_via_tool(text):
+        sys.stdout.write(_copy_osc52(text))
+        sys.stdout.flush()
+    state.status = f"copied {len(text)} chars"
+    return text
 
 
 def blocks_from_history(messages: list[dict]) -> list[Block]:
@@ -478,10 +776,13 @@ def _curses_setup() -> "curses._CursesWindow":
     # getch is never used.
     curses.raw()
     curses.noecho()
-    # NOTE: mouse reporting is deliberately NOT enabled. This system's ncurses
-    # enables SGR mouse mode but fails to parse the sequences; _decode_input
-    # swallows any mouse sequences that do arrive. Scroll with up/down,
-    # PgUp/PgDn, Home/End instead.
+    # Mouse reporting is fully enabled in run() (?1000h ?1002h ?1006h): the
+    # wheel arrives as a distinct SGR sequence (button 64/65) rather than
+    # being translated into arrow keys, and left-button press/drag/release
+    # drive our own selection (highlighted; on release the region is copied
+    # to the clipboard - local tool if installed, else OSC 52). Other mouse
+    # sequences are swallowed by the decoder;
+    # Up/Down recall user history (scroll when there is none).
     try:
         curses.curs_set(1)
     except curses.error:
@@ -489,11 +790,41 @@ def _curses_setup() -> "curses._CursesWindow":
     return stdscr
 
 
+def _decode_sgr_mouse(body: bytes):
+    """SGR mouse <button;col;row M/m: wheel up=64, down=65; left-button
+    press (0), drag motion (32) and release (m 0) become ("mouse", ...)
+    events for selection; other buttons are swallowed."""
+    parts = body[2:-1].split(b";")
+    if len(parts) != 3:
+        return None
+    try:
+        button, col, row = (int(p) for p in parts)
+    except ValueError:
+        return None
+    event = body[-1]
+    if button == 64:
+        return ("wheel", 1)
+    if button == 65:
+        return ("wheel", -1)
+    if button == 0 and event == ord("M"):
+        return ("mouse", ("press", col, row))
+    if button == 32 and event == ord("M"):
+        return ("mouse", ("drag", col, row))
+    if button == 0 and event == ord("m"):
+        return ("mouse", ("release", col, row))
+    if button == 1 and event == ord("M"):
+        return ("mouse", ("middle", col, row))
+    return None
+
+
 def _decode_esc_body(buf: bytes):
-    """Map a post-ESC byte sequence to a key constant; None = swallow (mouse
-    garbage or unknown protocol). Empty buffer = bare ESC."""
+    """Map a post-ESC byte sequence to a key constant, a ("wheel", delta)
+    event or a ("mouse", ...) event; None = swallow (unknown protocol).
+    Empty buffer = bare ESC."""
     if not buf:
         return K_ESC
+    if buf.startswith(b"[<"):  # SGR mouse
+        return _decode_sgr_mouse(buf)
     mapping = {
         b"[A": K_UP,
         b"[B": K_DOWN,
@@ -503,14 +834,21 @@ def _decode_esc_body(buf: bytes):
         b"[6~": K_NPAGE,
         b"[H": K_HOME,
         b"[F": K_END,
+        b"[1~": K_HOME,
+        b"[4~": K_END,
+        b"[3~": K_DELETE,
+        b"[1;5D": K_CTRL_LEFT,
+        b"[1;5C": K_CTRL_RIGHT,
     }
     return mapping.get(buf)
 
 
 def _decode_input(buf: bytes) -> tuple[list, bytes]:
-    """Split raw stdin bytes into complete key events plus any trailing
-    partial escape sequence (held back until more bytes arrive or the grace
-    period in run() expires). Mouse sequences are swallowed."""
+    """Split raw stdin bytes into complete key events (ints, plus
+    ("wheel", delta) and ("mouse", ...) tuples from SGR mouse) plus any
+    trailing partial escape sequence (held back until more bytes arrive or
+    the grace period in run() expires). Non-left-button mouse sequences are
+    swallowed."""
     keys: list = []
     i, n = 0, len(buf)
     while i < n:
@@ -571,7 +909,8 @@ class _InputDecoder:
         self.pend_start = 0.0
 
     def feed(self, data: bytes, now: float) -> list[tuple[str, object]]:
-        """Feed raw bytes; returns ("key", int) and ("paste", str) events."""
+        """Feed raw bytes; returns ("key", int), ("wheel", int) and
+        ("paste", str) events."""
         events: list[tuple[str, object]] = []
         self.buf += data
         while True:
@@ -589,17 +928,24 @@ class _InputDecoder:
             if i != -1:
                 head, rest = self.buf[:i], self.buf[i + 6:]
                 keys, rem = self._decode_keys(head, now)
-                events.extend(("key", k) for k in keys)
+                self._add_keys(events, keys)
                 self.buf = rem + rest  # hold any partial tail; keep the paste payload
                 self.in_paste = True
                 continue
             keys, rem = self._decode_keys(self.buf, now)
-            events.extend(("key", k) for k in keys)
+            self._add_keys(events, keys)
             self.buf = rem
             break
         return events
 
-    def _decode_keys(self, data: bytes, now: float) -> tuple[list[int], bytes]:
+    def _add_keys(self, events: list[tuple[str, object]], keys: list) -> None:
+        for k in keys:
+            if isinstance(k, tuple):  # ("wheel", delta) passes through as-is
+                events.append(k)
+            else:
+                events.append(("key", k))
+
+    def _decode_keys(self, data: bytes, now: float) -> tuple[list, bytes]:
         keys, rem = _decode_input(data)
         if rem:
             if self.pend_start == 0.0:
@@ -634,7 +980,7 @@ def _cursor_pos(state: UIState, height: int, width: int) -> tuple[int, int]:
     occupies the bottom input-block rows (long lines wrap), "> " on the
     first line."""
     lines = state.input_buf.split("\n") if state.input_buf else [""]
-    chunk_w = max(1, width - 2)
+    chunk_w = max(1, width - 3)
     li, start = 0, 0
     for i, ln in enumerate(lines):
         if state.cursor <= start + len(ln):
@@ -654,6 +1000,36 @@ def _cell_len(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
 
 
+def _draw_row_sel(stdscr, r: int, row: list[tuple[str, int]], width: int, c1: int, c2: int) -> None:
+    """Draw a row with A_REVERSE on the cells overlapping [c1, c2); runs of
+    the same selection state are drawn in one addnstr."""
+    col = 0
+    for text, style in row:
+        if col >= width - 1 or not text:
+            continue
+        base = _STYLE_ATTRS.get(style, 0)
+        i = 0
+        while i < len(text):
+            wch = 2 if unicodedata.east_asian_width(text[i]) in ("W", "F") else 1
+            if col + wch > width - 1:
+                return
+            sel = col < c2 and col + wch > c1
+            j = i + 1
+            while j < len(text):
+                ncol = col + _cell_len(text[i:j])
+                w2 = 2 if unicodedata.east_asian_width(text[j]) in ("W", "F") else 1
+                if (ncol < c2 and ncol + w2 > c1) != sel:
+                    break
+                j += 1
+            chunk = text[i:j]
+            try:
+                stdscr.addnstr(r, col, chunk, (width - 1) - col, base | (curses.A_REVERSE if sel else 0))
+            except curses.error:
+                return
+            col += _cell_len(chunk)
+            i = j
+
+
 def _render(stdscr, state: UIState) -> None:
     try:
         height, width = stdscr.getmaxyx()
@@ -667,6 +1043,10 @@ def _render(stdscr, state: UIState) -> None:
     except curses.error:
         pass
     for r, row in enumerate(rows[:height]):
+        bounds = _sel_row_bounds(state, r)
+        if bounds is not None:
+            _draw_row_sel(stdscr, r, row, width, bounds[0], bounds[1])
+            continue
         col = 0
         for text, style in row:
             if col >= width - 1 or not text:
@@ -718,7 +1098,14 @@ async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> Non
     # Bracketed paste: the terminal wraps pastes in ESC[200~ ... ESC[201~ so
     # an Enter inside a paste is literal text, not a submit. Terminals
     # without the feature never send the markers (paste degrades to typing).
-    sys.stdout.write("\x1b[?2004h")
+    # ?1000h: normal mouse tracking (wheel + press/release); ?1002h: button
+    # event tracking (drag motion - we own the mouse and implement selection
+    # ourselves, tmux-style); ?1006h: SGR encoding.
+    sys.stdout.write("\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    global _CLIP_CMDS, _CLIP_READ_CMDS
+    _CLIP_CMDS = _pick_clipboard_cmds()  # copy via local tool(s) if installed
+    _CLIP_READ_CMDS = _pick_clipboard_read_cmds()  # middle-click paste source
+    logger.info("clipboard tools: %s", [c[0] for c in _CLIP_CMDS] or ["none (OSC 52 only)"])
     sys.stdout.flush()
     try:
         while True:
@@ -731,6 +1118,7 @@ async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> Non
                 h, w = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8))[:2]
                 if (h, w) != stdscr.getmaxyx():
                     curses.resizeterm(h, w)
+                    _clear_selection(state)  # screen coords no longer map
             except Exception:
                 pass
             height, width = stdscr.getmaxyx()
@@ -740,7 +1128,12 @@ async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> Non
                 if kind == "paste":
                     _insert_text(state, str(value))
                     continue
-                action, payload = apply_key(state, int(value), view_h=view_h, total=count_lines(state, width))
+                if kind == "mouse":  # (event, col1, row1) from SGR left button
+                    ev, col, row = value
+                    _apply_mouse(state, ev, col, row, height, width)
+                    continue
+                key = ("wheel", int(value)) if kind == "wheel" else int(value)
+                action, payload = apply_key(state, key, view_h=view_h, total=count_lines(state, width))
                 if action == "submit":
                     msg_id = uuid.uuid4().hex[:8]
                     submit_message(state, payload)
@@ -766,7 +1159,7 @@ async def run(bus: Bus, context_size: int | Callable[[], int | None] = 0) -> Non
         except Exception:
             pass
         try:
-            sys.stdout.write("\x1b[?2004l")  # disable bracketed paste
+            sys.stdout.write("\x1b[?2004l\x1b[?1000l\x1b[?1002l")  # disable paste + mouse modes
             sys.stdout.flush()
         except Exception:
             pass

@@ -1001,6 +1001,8 @@ def _load_client(client_type: str):
         return importlib.import_module(CLIENTS[client_type])
     except KeyError:
         raise ValueError(f"Unknown client type: {client_type}") from None
+    except ImportError as e:
+        raise ValueError(f"Cannot load client {client_type!r}: {e}") from None
 
 
 async def async_main(client_type: str, session_id: str | None = None) -> None:
