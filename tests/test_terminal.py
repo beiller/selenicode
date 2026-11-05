@@ -878,6 +878,62 @@ class TestMarkdown(unittest.TestCase):
         self.assertIn(("hi", self.B), lines[0])
 
 
+class TestToolDiff(unittest.TestCase):
+    D = t2.STY_DIM
+    A = t2.STY_DIFF_ADD
+    R = t2.STY_DIFF_DEL
+    T = t2.STY_TOOL
+
+    def test_edit_file_diff(self):
+        lines = t2._tool_call_lines("edit_file", {"file_path": "a.py", "old_string": "x\ny\nz", "new_string": "x\nY\nz"})
+        self.assertEqual(lines[0], [("edit_file a.py", self.T)])
+        self.assertEqual(lines[1], [("  x", self.D)])
+        self.assertEqual(lines[2], [("- y", self.R)])
+        self.assertEqual(lines[3], [("+ Y", self.A)])
+        self.assertEqual(lines[4], [("  z", self.D)])
+
+    def test_replace_opcode_all_del_then_add(self):
+        self.assertEqual(
+            t2._diff_lines("a\nb\nc", "d\ne"),
+            [("- a", self.R), ("- b", self.R), ("- c", self.R), ("+ d", self.A), ("+ e", self.A)],
+        )
+
+    def test_edit_file_replace_all_header(self):
+        lines = t2._tool_call_lines("edit_file", {"file_path": "a.py", "old_string": "a", "new_string": "b", "replace_all": True})
+        self.assertEqual(lines[0], [("edit_file a.py (replace_all)", self.T)])
+
+    def test_write_file_all_plus(self):
+        lines = t2._tool_call_lines("write_file", {"file_path": "f.txt", "content": "l1\nl2\nl3"})
+        self.assertEqual(lines[0], [("write_file f.txt", self.T)])
+        self.assertEqual(lines[1:], [[("+ l1", self.A)], [("+ l2", self.A)], [("+ l3", self.A)]])
+
+    def test_all_lines_no_cap(self):
+        old = "\n".join(f"o{i}" for i in range(30))
+        new = "\n".join(f"n{i}" for i in range(30))
+        lines = t2._tool_call_lines("edit_file", {"file_path": "a.py", "old_string": old, "new_string": new})
+        self.assertEqual(len(lines), 61)  # header + 30 del + 30 add
+
+    def test_unknown_tool_none(self):
+        self.assertIsNone(t2._tool_call_lines("read_file", {"file_path": "a.py"}))
+
+    def test_write_file_missing_content_none(self):
+        self.assertIsNone(t2._tool_call_lines("write_file", {"file_path": "a.py"}))
+
+    def test_block_renders_diff(self):
+        state = t2.UIState()
+        b = t2.Block("tool", "", "edit_file(...)", t2.STY_TOOL, {"name": "edit_file", "args": {"file_path": "a.py", "old_string": "x\ny", "new_string": "x\nZ"}})
+        lines = t2._block_lines(state, b, 60)
+        self.assertEqual(lines[0], [("edit_file a.py", self.T)])
+        self.assertIn([("- y", self.R)], lines)
+        self.assertIn([("+ Z", self.A)], lines)
+
+    def test_tool_block_without_extra_unchanged(self):
+        state = t2.UIState()
+        b = t2.Block("tool", "", "read_file(path='a.py')", t2.STY_TOOL)
+        lines = t2._block_lines(state, b, 60)
+        self.assertEqual(lines[0], [("read_file(path='a.py')", t2.STY_TOOL)])
+
+
 class TestCellLen(unittest.TestCase):
     def test_cell_widths(self):
         self.assertEqual(t2._cell_len("abc"), 3)

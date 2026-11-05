@@ -21,6 +21,7 @@ click pastes; wheel scrolls.
 import asyncio
 import base64
 import curses
+import difflib
 import fcntl
 import json
 import logging
@@ -92,6 +93,8 @@ STY_BOLD = 8
 STY_ITALIC = 9
 STY_CODE = 10
 STY_NUM = 11  # fenced code line numbers: gray color pair (A_DIM alone is often ignored)
+STY_DIFF_ADD = 12  # diff added lines: plain green
+STY_DIFF_DEL = 13  # diff removed lines: plain red
 
 _ROLE_STYLE = {
     "thinking": STY_DIM,
@@ -111,13 +114,14 @@ _ROLE_PREFIX = {
 class Block:
     """One rendered message: role-styled raw text wrapped at render time."""
 
-    __slots__ = ("role", "prefix", "raw", "style")
+    __slots__ = ("role", "prefix", "raw", "style", "extra")
 
-    def __init__(self, role: str, prefix: str, raw: str, style: int) -> None:
+    def __init__(self, role: str, prefix: str, raw: str, style: int, extra: dict | None = None) -> None:
         self.role = role
         self.prefix = prefix
         self.raw = raw
         self.style = style
+        self.extra = extra  # structured payload (e.g. tool-call args for diff rendering)
 
 
 class UIState:
@@ -491,6 +495,41 @@ def _md_block_lines(raw: str, first_w: int, rest_w: int) -> list[list[tuple[str,
     return out if any_md else None
 
 
+def _diff_lines(old: str, new: str) -> list[tuple[str, int]]:
+    """Scoped unified-diff of a replacement region: context (dim), '-' (red), '+' (green).
+
+    All lines are shown - no collapsing. Lines are not wrapped or truncated here;
+    the renderer clips at the screen edge."""
+    sm = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines())
+    out: list[tuple[str, int]] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("equal", "replace"):
+            for ln in old.splitlines()[i1:i2]:
+                out.append(("  " + ln, STY_DIM) if tag == "equal" else ("- " + ln, STY_DIFF_DEL))
+        if tag in ("insert", "replace"):
+            for ln in new.splitlines()[j1:j2]:
+                out.append(("+ " + ln, STY_DIFF_ADD))
+    return out
+
+
+def _tool_call_lines(name: str, args: dict) -> list[list[tuple[str, int]]] | None:
+    """Diff-style rendering for file-mutating tool calls; None for other tools."""
+    if name == "edit_file":
+        header = f"edit_file {args.get('file_path', '?')}"
+        if args.get("replace_all"):
+            header += " (replace_all)"
+        body = _diff_lines(args.get("old_string", ""), args.get("new_string", ""))
+    elif name == "write_file":
+        content = args.get("content")
+        if content is None:
+            return None
+        header = f"write_file {args.get('file_path', '?')}"
+        body = [("+ " + ln, STY_DIFF_ADD) for ln in content.splitlines()]
+    else:
+        return None
+    return [[(header, STY_TOOL)]] + [[seg] for seg in body]
+
+
 def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[str, int]]]:
     """Wrapped, styled lines for a block; finalized blocks are cached per
     (block, width). The active block is never cached: its raw text grows on
@@ -515,24 +554,31 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
     else:
         # Usable row width is width-1 cells (the last column is reserved); the
         # first line carries the prefix, continuation lines a 2-cell indent.
-        md = None
-        if block.role == "assistant":
-            md = _md_block_lines(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
-        if md is not None:
-            for i, segs in enumerate(md):
-                if i == 0 and block.prefix:
-                    lines.append([(block.prefix, block.style)] + segs)
-                else:
-                    lines.append(segs)
-        else:
-            wrapped = _wrap_block(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
-            for i, ln in enumerate(wrapped):
-                if i == 0 and block.prefix:
-                    lines.append([(block.prefix, block.style), (ln, block.style)])
-                elif i > 0:
-                    lines.append([("  " + ln, block.style)])
-                else:
-                    lines.append([(ln, block.style)])
+        handled = False
+        if block.role == "tool" and block.extra:
+            tl = _tool_call_lines(block.extra.get("name", ""), block.extra.get("args") or {})
+            if tl is not None:
+                lines.extend(tl)
+                handled = True
+        if not handled:
+            md = None
+            if block.role == "assistant":
+                md = _md_block_lines(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
+            if md is not None:
+                for i, segs in enumerate(md):
+                    if i == 0 and block.prefix:
+                        lines.append([(block.prefix, block.style)] + segs)
+                    else:
+                        lines.append(segs)
+            else:
+                wrapped = _wrap_block(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
+                for i, ln in enumerate(wrapped):
+                    if i == 0 and block.prefix:
+                        lines.append([(block.prefix, block.style), (ln, block.style)])
+                    elif i > 0:
+                        lines.append([("  " + ln, block.style)])
+                    else:
+                        lines.append([(ln, block.style)])
     if block is not state.active:
         state.cache[key] = ((width, state.show_thinking), lines)
     return lines
@@ -995,6 +1041,7 @@ def blocks_from_history(messages: list[dict]) -> list[Block]:
             elif content:
                 out.append(Block("assistant", "\U0001F916: ", content, STY_PLAIN))
             for tc in m.get("tool_calls") or []:
+                args = None
                 try:
                     fn = tc["function"]
                     args = json.loads(fn.get("arguments") or "{}")
@@ -1004,7 +1051,8 @@ def blocks_from_history(messages: list[dict]) -> list[Block]:
                 if len(args_short) > 200:
                     args_short = args_short[:200] + "..."
                 name = fn.get("name", "?") if isinstance(fn, dict) else "?"
-                out.append(Block("tool", "", f"{name}({args_short})", STY_TOOL))
+                extra = {"name": name, "args": args} if isinstance(args, dict) else None
+                out.append(Block("tool", "", f"{name}({args_short})", STY_TOOL, extra))
         # tool results are not rendered (parity with the Textual client)
     return out
 
@@ -1096,10 +1144,13 @@ def _curses_setup() -> "curses._CursesWindow":
                 STY_CODE: curses.color_pair(2),
                 # gray + faint where the terminal honors it (VTE ignores A_DIM alone)
                 STY_NUM: curses.color_pair(6) | curses.A_DIM,
+                # plain (non-bold) green/red: distinct from bold-green status / bold-red error
+                STY_DIFF_ADD: curses.color_pair(4),
+                STY_DIFF_DEL: curses.color_pair(5),
             }
         )
     except curses.error:
-        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD, STY_WARN: 0, STY_BOLD: curses.A_BOLD, STY_ITALIC: curses.A_ITALIC, STY_CODE: 0, STY_NUM: curses.A_DIM})
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD, STY_WARN: 0, STY_BOLD: curses.A_BOLD, STY_ITALIC: curses.A_ITALIC, STY_CODE: 0, STY_NUM: curses.A_DIM, STY_DIFF_ADD: curses.A_BOLD, STY_DIFF_DEL: 0})
     # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
     # our decoder instead of raising SIGINT. Input is read from stdin directly;
     # getch is never used.
