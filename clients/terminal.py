@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import struct
 import subprocess
@@ -86,6 +87,11 @@ STY_INFO = 4
 STY_STATUS = 5
 STY_ERROR = 6
 STY_WARN = 7
+# inline markdown (assistant messages only)
+STY_BOLD = 8
+STY_ITALIC = 9
+STY_CODE = 10
+STY_NUM = 11  # fenced code line numbers: gray color pair (A_DIM alone is often ignored)
 
 _ROLE_STYLE = {
     "thinking": STY_DIM,
@@ -179,6 +185,312 @@ def _wrap_block(text: str, first_w: int, rest_w: int) -> list[str]:
     return out
 
 
+# --- poor man's markdown (assistant messages only) -------------------------
+
+
+def _md_edge_alnum(line: str, idx: int) -> bool:
+    return 0 <= idx < len(line) and line[idx].isalnum()
+
+
+def _md_find_spans(line: str) -> list[tuple[int, int, int]]:
+    """(start, end, style) marker-inclusive regions of a line. Unbalanced or
+    ambiguous markers (e.g. "2*3*4", "O(n * m)", my_var) stay literal."""
+    spans: list[tuple[int, int, int]] = []
+    for m in re.finditer(r"`([^`\n]+)`", line):
+        spans.append((m.start(), m.end(), STY_CODE))
+    i = 0
+    while True:  # **bold**
+        s = line.find("**", i)
+        if s == -1:
+            break
+        e = line.find("**", s + 2)
+        if (e != -1
+                and not any(a <= s < b or a <= e < b or a >= s and b <= e + 2 for a, b, _ in spans)):
+            content = line[s + 2:e]
+            if (content and not content[0].isspace() and not content[-1].isspace()
+                    and not _md_edge_alnum(line, s - 1) and not _md_edge_alnum(line, e + 2)):
+                spans.append((s, e + 2, STY_BOLD))
+                i = e + 2
+                continue
+        i = s + 2
+    for ch in ("*", "_"):  # *italic* / _italic_
+        i = 0
+        while True:
+            s = line.find(ch, i)
+            if s == -1:
+                break
+            e = line.find(ch, s + 1)
+            if (e != -1
+                    and not any(a <= s < b or a <= e < b or a >= s and b <= e + 1 for a, b, _ in spans)):
+                content = line[s + 1:e]
+                if (content and ch not in content and not content[0].isspace()
+                        and not content[-1].isspace()
+                        and not _md_edge_alnum(line, s - 1) and not _md_edge_alnum(line, e + 1)):
+                    spans.append((s, e + 1, STY_ITALIC))
+            i = s + 1
+    return sorted(spans)
+
+
+def _md_inline_words(line: str) -> list[tuple[str, int]] | None:
+    """(word, style) pairs for a line containing markdown; None when it has
+    no markers (caller falls back to the plain wrap)."""
+    spans = _md_find_spans(line)
+    if not spans:
+        return None
+    words: list[tuple[str, int]] = []
+    pos = 0
+    for start, end, style in spans:
+        cut = 2 if style == STY_BOLD else 1
+        for w in line[pos:start].split():
+            words.append((w, STY_PLAIN))
+        for w in line[start + cut:end - cut].split():
+            words.append((w, style))
+        pos = end
+    for w in line[pos:].split():
+        words.append((w, STY_PLAIN))
+    return words or None
+
+
+def _split_cells(text: str, width: int) -> list[str]:
+    """Split text into chunks of at most `width` cells (wide chars intact)."""
+    out: list[str] = []
+    cur = ""
+    w = 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cur and w + cw > width:
+            out.append(cur)
+            cur, w = "", 0
+        cur += ch
+        w += cw
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _wrap_tokens(words: list[tuple[str, int]], first_w: int, rest_w: int | None = None) -> list[list[tuple[str, int]]]:
+    """Wrap (word, style) pairs: line 0 is limited to first_w, all following
+    lines to rest_w (first_w when rest_w is None). Words longer than the line
+    are hard-split, keeping their style on every chunk."""
+    if rest_w is None:
+        rest_w = first_w
+    lines: list[list[tuple[str, int]]] = []
+    cur: list[tuple[str, int]] = []
+    cur_w = 0
+
+    def flush() -> None:
+        nonlocal cur, cur_w
+        if cur or not lines:
+            lines.append(cur)
+        cur, cur_w = [], 0
+
+    for word, style in words:
+        w = _cell_len(word)
+        limit = first_w if not lines else rest_w
+        if w > limit:
+            if cur_w:
+                flush()
+            chunks = _split_cells(word, max(1, limit))
+            lines.extend([(c, style) for c in chunks[:-1]])
+            cur = [(chunks[-1], style)]
+            cur_w = _cell_len(chunks[-1])
+            continue
+        if cur_w and cur_w + 1 + w > limit:
+            flush()
+        if cur_w:
+            cur.append((" ", STY_PLAIN))  # separators stay unstyled (no bg color)
+        cur.append((word, style))
+        cur_w += (0 if cur_w == 0 else 1) + w
+    flush()
+    return lines
+
+
+_MD_LIST = re.compile(r"^(\s*)([-*+]|\d{1,2}[.)])\s+(.*)$")
+
+
+def _md_list_item(indent: str, marker: str, content: str, w: int) -> list[list[tuple[str, int]]]:
+    """One list item as styled lines with a hanging indent (2 cells per
+    nesting level, capped)."""
+    level = min(len(indent) // 2, 3)
+    bullet = "\u2022 " if not marker[0].isdigit() else f"{marker} "
+    prefix = "  " * level + bullet
+    hang = _cell_len(prefix)
+    cw = max(1, w - hang)
+    words = _md_inline_words(content)
+    if words is not None:
+        wrapped = _wrap_tokens(words, cw)
+    else:
+        wrapped = textwrap.wrap(content, cw) or [""]
+    out: list[list[tuple[str, int]]] = []
+    for i, ln in enumerate(wrapped):
+        lead = (prefix if i == 0 else " " * hang, STY_PLAIN)
+        out.append([lead] + ([(ln, STY_PLAIN)] if isinstance(ln, str) else ln))
+    return out
+
+
+def _md_table_cells(ln: str) -> list[str] | None:
+    s = ln.strip()
+    if not s.startswith("|") or s.count("|") < 2:
+        return None
+    return [c.strip() for c in s.strip("|").split("|")]
+
+
+def _md_is_sep(cells: list[str]) -> bool:
+    joined = "".join(cells)
+    return bool(joined) and set(joined) <= set("-: ") and "-" in joined
+
+
+def _truncate_cells(text: str, width: int) -> str:
+    """Truncate to `width` cells (wide-char safe), ellipsizing."""
+    if _cell_len(text) <= width:
+        return text
+    out = ""
+    w = 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > max(1, width - 1):
+            break
+        out += ch
+        w += cw
+    return out + "\u2026"
+
+
+def _md_table(rows: list[list[str]], w: int, cell_style: int = STY_PLAIN, header_style: int = STY_BOLD) -> list[list[tuple[str, int]]] | None:
+    """Aligned table (rows[0] = header, separator row already dropped); None
+    when it cannot fit even with capped columns (caller renders raw lines)."""
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    col_w = [max(_cell_len(r[i]) for r in rows) for i in range(ncols)]
+    if sum(col_w) + 2 * ncols > w:  # "| a | b |" costs sum + 2 per column
+        cap = max(1, (w - 2 * ncols) // ncols)
+        col_w = [min(cw, cap) for cw in col_w]
+        if sum(col_w) + 2 * ncols > w:
+            return None
+    out: list[list[tuple[str, int]]] = []
+    for i, r in enumerate(rows):
+        segs: list[tuple[str, int]] = [("| ", cell_style)]
+        for j, c in enumerate(r):
+            c = _truncate_cells(c, col_w[j])
+            style = header_style if i == 0 else cell_style
+            segs.append((c, style))
+            segs.append((" " * (col_w[j] - _cell_len(c)) + (" | " if j < ncols - 1 else " |"), cell_style))
+        out.append(segs)
+    return out
+
+
+def _md_block_lines(raw: str, first_w: int, rest_w: int) -> list[list[tuple[str, int]]] | None:
+    """Poor man's markdown for one assistant message: **bold**, *italic*,
+    `code`, ``` fences, bullet/numbered lists and |tables|. Returns styled
+    lines (line 0 limited to first_w, continuations indented 2 cells), or
+    None when nothing markdown-ish is present (caller uses _wrap_block)."""
+    out: list[list[tuple[str, int]]] = []
+    any_md = False
+    lines = raw.split("\n")
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        # fenced code block (no inline parsing inside; unclosed at EOF is fine)
+        if ln.strip().startswith("```"):
+            any_md = True
+            out.append([(ln.strip(), STY_CODE)])
+            i += 1
+            end = i
+            while end < n and not lines[end].strip().startswith("```"):
+                end += 1
+            num_w = max(3, len(str(end - i)))  # dim line numbers, min width 3
+            pad = " " * (num_w + 1)
+            cw = max(1, rest_w - num_w - 1)
+            num = 0
+            while i < end:
+                # tables inside fences still get aligned (basic handling), but
+                # stay in code style - agents fence data tables all the time
+                cells = _md_table_cells(lines[i])
+                if cells is not None and i + 1 < end:
+                    sep = _md_table_cells(lines[i + 1])
+                    if sep is not None and _md_is_sep(sep):
+                        rows = [cells]
+                        j = i + 2
+                        while j < end:
+                            rc = _md_table_cells(lines[j])
+                            if rc is None:
+                                break
+                            rows.append(rc)
+                            j += 1
+                        table = _md_table(rows, cw, STY_CODE, STY_CODE)
+                        if table is None:
+                            for k in range(i, j):  # too wide: plain code lines
+                                num += 1
+                                first = True
+                                for c in textwrap.wrap(lines[k], cw) or [""]:
+                                    lead = (f"{num:>{num_w}} ", STY_NUM) if first else (pad, STY_CODE)
+                                    out.append([lead, (c, STY_CODE)])
+                                    first = False
+                        else:
+                            for tln in table:
+                                num += 1
+                                out.append([(f"{num:>{num_w}} ", STY_NUM)] + tln)
+                        i = j
+                        continue
+                num += 1
+                first = True
+                for c in textwrap.wrap(lines[i], cw) or [""]:
+                    lead = (f"{num:>{num_w}} ", STY_NUM) if first else (pad, STY_CODE)
+                    out.append([lead, (c, STY_CODE)])
+                    first = False
+                i += 1
+            if i < n:
+                out.append([(lines[i].strip(), STY_CODE)])
+                i += 1
+            continue
+        # table: a |row| followed by a |---| separator row
+        cells = _md_table_cells(ln)
+        if cells is not None and i + 1 < n:
+            sep = _md_table_cells(lines[i + 1])
+            if sep is not None and _md_is_sep(sep):
+                rows = [cells]
+                j = i + 2
+                while j < n:
+                    rc = _md_table_cells(lines[j])
+                    if rc is None:
+                        break
+                    rows.append(rc)
+                    j += 1
+                table = _md_table(rows, max(1, first_w if i == 0 else rest_w))
+                if table is None:
+                    for k in range(i, j):  # too wide: render raw
+                        out.append([(lines[k], STY_PLAIN)])
+                else:
+                    any_md = True
+                    out.extend(table)
+                i = j
+                continue
+        m = _MD_LIST.match(ln)
+        if m:
+            any_md = True
+            out.extend(_md_list_item(m.group(1), m.group(2), m.group(3), max(1, first_w if i == 0 else rest_w)))
+            i += 1
+            continue
+        words = _md_inline_words(ln)
+        if words is None:
+            # plain line: wrap exactly like _wrap_block does
+            if i == 0 and ln:
+                first, rest = _first_line(ln, max(1, first_w))
+                out.append([(first, STY_PLAIN)])
+                for c in textwrap.wrap(rest, max(1, rest_w)):
+                    out.append([("  " + c, STY_PLAIN)])
+            else:
+                for c in (textwrap.wrap(ln, max(1, rest_w)) or [""]):
+                    out.append([("  " + c, STY_PLAIN)])
+        else:
+            any_md = True
+            wrapped = _wrap_tokens(words, max(1, first_w), max(1, rest_w))
+            out.append(wrapped[0])
+            for tl in wrapped[1:]:
+                out.append([("  ", STY_PLAIN)] + tl)
+        i += 1
+    return out if any_md else None
+
+
 def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[str, int]]]:
     """Wrapped, styled lines for a block; finalized blocks are cached per
     (block, width). The active block is never cached: its raw text grows on
@@ -203,14 +515,24 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
     else:
         # Usable row width is width-1 cells (the last column is reserved); the
         # first line carries the prefix, continuation lines a 2-cell indent.
-        wrapped = _wrap_block(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
-        for i, ln in enumerate(wrapped):
-            if i == 0 and block.prefix:
-                lines.append([(block.prefix, block.style), (ln, block.style)])
-            elif i > 0:
-                lines.append([("  " + ln, block.style)])
-            else:
-                lines.append([(ln, block.style)])
+        md = None
+        if block.role == "assistant":
+            md = _md_block_lines(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
+        if md is not None:
+            for i, segs in enumerate(md):
+                if i == 0 and block.prefix:
+                    lines.append([(block.prefix, block.style)] + segs)
+                else:
+                    lines.append(segs)
+        else:
+            wrapped = _wrap_block(block.raw, max(1, width - 1 - _cell_len(block.prefix)), max(1, width - 3))
+            for i, ln in enumerate(wrapped):
+                if i == 0 and block.prefix:
+                    lines.append([(block.prefix, block.style), (ln, block.style)])
+                elif i > 0:
+                    lines.append([("  " + ln, block.style)])
+                else:
+                    lines.append([(ln, block.style)])
     if block is not state.active:
         state.cache[key] = ((width, state.show_thinking), lines)
     return lines
@@ -754,6 +1076,7 @@ def _curses_setup() -> "curses._CursesWindow":
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_GREEN, -1)
         curses.init_pair(5, curses.COLOR_RED, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)  # soft gray (palette white) for line numbers
         _STYLE_ATTRS.update(
             {
                 STY_PLAIN: 0,
@@ -767,10 +1090,16 @@ def _curses_setup() -> "curses._CursesWindow":
                 STY_ERROR: curses.A_BOLD | curses.color_pair(5),
                 # plain yellow (the bold yellow pair is taken by info)
                 STY_WARN: curses.color_pair(3),
+                STY_BOLD: curses.A_BOLD,
+                STY_ITALIC: curses.A_ITALIC,
+                # magenta like tool output: "code-ish"
+                STY_CODE: curses.color_pair(2),
+                # gray + faint where the terminal honors it (VTE ignores A_DIM alone)
+                STY_NUM: curses.color_pair(6) | curses.A_DIM,
             }
         )
     except curses.error:
-        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD, STY_WARN: 0})
+        _STYLE_ATTRS.update({STY_PLAIN: 0, STY_DIM: curses.A_DIM, STY_YOU: curses.A_BOLD, STY_TOOL: 0, STY_INFO: curses.A_BOLD, STY_STATUS: curses.A_BOLD, STY_ERROR: curses.A_BOLD, STY_WARN: 0, STY_BOLD: curses.A_BOLD, STY_ITALIC: curses.A_ITALIC, STY_CODE: 0, STY_NUM: curses.A_DIM})
     # raw() (not cbreak) so ISIG is off: Ctrl+C arrives as a 0x03 byte for
     # our decoder instead of raising SIGINT. Input is read from stdin directly;
     # getch is never used.

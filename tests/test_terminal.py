@@ -735,6 +735,149 @@ class TestMouseSelection(unittest.TestCase):
         self.assertIsNone(state.sel_anchor)
 
 
+class TestMarkdown(unittest.TestCase):
+    P = t2.STY_PLAIN
+    B = t2.STY_BOLD
+    IT = t2.STY_ITALIC
+    C = t2.STY_CODE
+
+    def test_bold(self):
+        self.assertEqual(
+            t2._md_block_lines("hello **bold** world", 40, 40),
+            [[("hello", self.P), (" ", self.P), ("bold", self.B), (" ", self.P), ("world", self.P)]],
+        )
+
+    def test_italic_star_and_underscore(self):
+        self.assertEqual(
+            t2._md_block_lines("a *it* b", 40, 40),
+            [[("a", self.P), (" ", self.P), ("it", self.IT), (" ", self.P), ("b", self.P)]],
+        )
+        self.assertEqual(
+            t2._md_block_lines("a _it_ b", 40, 40),
+            [[("a", self.P), (" ", self.P), ("it", self.IT), (" ", self.P), ("b", self.P)]],
+        )
+
+    def test_code_span(self):
+        lines = t2._md_block_lines("run `x = 1` now", 40, 40)
+        self.assertEqual(
+            lines,
+            [[("run", self.P), (" ", self.P), ("x", self.C), (" ", self.P), ("=", self.C),
+              (" ", self.P), ("1", self.C), (" ", self.P), ("now", self.P)]],
+        )
+
+    def test_unbalanced_marker_is_literal(self):
+        self.assertIsNone(t2._md_block_lines("a ** b", 40, 40))
+
+    def test_math_and_identifiers_not_italic(self):
+        self.assertIsNone(t2._md_block_lines("O(n * m)", 40, 40))
+        self.assertIsNone(t2._md_block_lines("2*3*4", 40, 40))
+        self.assertIsNone(t2._md_block_lines("my_var_name", 40, 40))
+
+    def test_bold_with_code_inside_degrades(self):
+        lines = t2._md_block_lines("use **`x`** now", 40, 40)
+        styles = [s for _, s in lines[0]]
+        self.assertNotIn(self.B, styles)
+        self.assertIn(self.C, styles)
+
+    def test_wrap_keeps_style_across_lines(self):
+        raw = "**" + " ".join(["word"] * 10) + "**"
+        lines = t2._md_block_lines(raw, 20, 20)
+        self.assertEqual(len(lines), 3)
+        for ln in lines:
+            body = [s for s in ln if s[0] not in ("  ", " ")]  # skip indent/space leads
+            self.assertTrue(all(s == self.B for _, s in body))
+        self.assertEqual(sum(len([s for s in ln if s[0] not in ("  ", " ")]) for ln in lines), 10)
+
+    def test_bullet_list(self):
+        lines = t2._md_block_lines("- one\n- two", 40, 40)
+        self.assertEqual(lines[0], [("\u2022 ", self.P), ("one", self.P)])
+        self.assertEqual(lines[1], [("\u2022 ", self.P), ("two", self.P)])
+
+    def test_nested_bullet(self):
+        lines = t2._md_block_lines("- one\n  - sub", 40, 40)
+        self.assertEqual(lines[1][0], ("  \u2022 ", self.P))
+
+    def test_hanging_indent(self):
+        lines = t2._md_block_lines("- " + " ".join(["word"] * 20), 40, 40)
+        self.assertGreater(len(lines), 1)
+        for ln in lines:
+            self.assertLessEqual(sum(t2._cell_len(t) for t, _ in ln), 40)
+        self.assertEqual(lines[1][0], ("  ", self.P))
+
+    def test_table(self):
+        lines = t2._md_block_lines("| a | b |\n|---|---|\n| 1 | 22222 |", 40, 40)
+        self.assertEqual(len(lines), 2)  # separator row dropped
+        self.assertIn(("a", self.B), lines[0])
+        self.assertIn(("22222", self.P), lines[1])
+        # aligned: every row has the same cell width
+        w = [sum(t2._cell_len(t) for t, _ in ln) for ln in lines]
+        self.assertEqual(w[0], w[1])
+
+    def test_table_too_wide_falls_back_raw(self):
+        self.assertIsNone(t2._md_table([["a", "b"], ["1", "2"]], 5))
+        # with other markdown present the too-wide table renders raw
+        raw = "**hi**\n| a | b |\n|---|---|\n| 1 | 2 |"
+        lines = t2._md_block_lines(raw, 5, 5)
+        self.assertEqual(len(lines), 4)
+        self.assertIn(("hi", self.B), lines[0])
+        self.assertEqual(lines[3], [("| 1 | 2 |", self.P)])  # unaligned raw, no indent
+
+    def test_fence(self):
+        lines = t2._md_block_lines("```py\ncode **x** here\n```", 40, 40)
+        self.assertEqual(len(lines), 3)  # tag line, numbered code line, closing fence
+        self.assertEqual(lines[1][0], ("  1 ", t2.STY_NUM))
+        self.assertTrue(all(s == self.C for _, s in lines[1][1:]))
+        self.assertIn("**x**", "".join(t for t, _ in lines[1][1:]))  # literal inside code
+
+    def test_fenced_code_line_numbers(self):
+        raw = "```\na\nb\nc\n```"
+        lines = t2._md_block_lines(raw, 40, 40)
+        self.assertEqual(len(lines), 5)  # fence, 3 numbered lines, fence
+        for i in range(1, 4):
+            self.assertEqual(lines[i][0], (f"{i:>3} ", t2.STY_NUM))
+
+    def test_fenced_code_number_width(self):
+        raw = "```\n" + "\n".join(f"l{n}" for n in range(1, 13)) + "\n```"
+        lines = t2._md_block_lines(raw, 40, 40)
+        # 12 lines: max(3, 2) = 3 wide, right-aligned
+        self.assertEqual(lines[1][0], ("  1 ", t2.STY_NUM))
+        self.assertEqual(lines[10][0], (" 10 ", t2.STY_NUM))
+
+    def test_fenced_code_wrapped_continuation_padding(self):
+        raw = "```\n" + "x" * 50 + "\n```"
+        lines = t2._md_block_lines(raw, 40, 40)
+        # cw = 40 - 4 = 36: wraps into 36 + 14; continuation aligns under code
+        self.assertEqual(lines[1][0], ("  1 ", t2.STY_NUM))
+        self.assertEqual(lines[2][0], ("    ", t2.STY_CODE))
+        self.assertEqual(len(lines[1][1][0]), 36)
+
+    def test_fenced_table_aligned(self):
+        raw = "```\n| A | B |\n|---|---|\n| 0 | 11 |\n```"
+        lines = t2._md_block_lines(raw, 40, 40)
+        self.assertEqual(len(lines), 4)  # fence, header, row, fence
+        self.assertEqual(lines[1][0], ("  1 ", t2.STY_NUM))
+        self.assertTrue(all(s == self.C for _, s in ln[1:]) for ln in lines[1:3])  # no bold
+        w = [sum(t2._cell_len(t) for t, _ in ln[1:]) for ln in lines[1:3]]
+        self.assertEqual(w[0], w[1])  # aligned (excluding the number lead)
+
+    def test_plain_block_returns_none(self):
+        self.assertIsNone(t2._md_block_lines("just text\nmore", 40, 40))
+
+    def test_user_block_stays_literal(self):
+        state = t2.UIState()
+        b = t2.Block("user", "You: ", "**x**", t2.STY_YOU)
+        lines = t2._block_lines(state, b, 60)
+        self.assertTrue(all(s == t2.STY_YOU for _, s in lines[0]))
+        self.assertIn("**x**", "".join(t for t, _ in lines[0]))
+
+    def test_assistant_prefix_and_bold(self):
+        state = t2.UIState()
+        b = t2.Block("assistant", "\U0001F916: ", "**hi** there", t2.STY_PLAIN)
+        lines = t2._block_lines(state, b, 60)
+        self.assertEqual(lines[0][0], ("\U0001F916: ", t2.STY_PLAIN))
+        self.assertIn(("hi", self.B), lines[0])
+
+
 class TestCellLen(unittest.TestCase):
     def test_cell_widths(self):
         self.assertEqual(t2._cell_len("abc"), 3)
