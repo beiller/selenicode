@@ -699,7 +699,7 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
             emit(user_id, "info", "Interrupted. What can I help you with?")
             return ""
 
-        size = context_token_count(messages)
+        size = effective_context_size(user_id, messages)
         if size > compaction_trigger(CONTEXT_SIZE):
             logger.info(f"Context {size} tokens exceeded trigger mid-loop, compacting")
             await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
@@ -735,6 +735,8 @@ async def run_tool_loop(base_url: str, user_id: UserID, messages: list[Message],
         assistant_msg, usage = consume_task.result()
         if usage is not None:
             bus.outbound.put_nowait(UsageReport(user_id, usage))
+            if usage.get("prompt_tokens") is not None:
+                last_prompt_tokens[user_id] = (usage["prompt_tokens"], len(messages))
         emit(user_id, "assistant", "", False)  # send a final empty message so the client knows the end of message.
         tool_msgs = await execute_tool_calls(assistant_msg, registry, user_id)
 
@@ -765,7 +767,7 @@ async def handle_message(user_input: str, base_url: str, user_id: UserID, sessio
 
         await run_tool_loop(base_url, user_id, messages, session_id)  # modifies messages
 
-        if context_token_count(messages) > compaction_trigger(CONTEXT_SIZE):
+        if effective_context_size(user_id, messages) > compaction_trigger(CONTEXT_SIZE):
             logger.info("Compacting conversation")
             compacted = await compact_messages(base_url, messages, session_id, CONTEXT_SIZE, CURRENT_MODEL)
             size = approximate_token_count(json.dumps(messages))
@@ -800,6 +802,26 @@ def get_user_messages(user_id: UserID) -> list[Message]:
 
 def set_user_messages(user_id: UserID, messages: list[Message]) -> None:
     user_registry[user_id] = messages
+
+
+last_prompt_tokens: dict[UserID, tuple[int, int]] = {}
+
+
+def effective_context_size(user_id: UserID, messages: list[Message]) -> int:
+    """Context size grounded in the last real prompt_tokens when available.
+
+    The stored count covers messages[:n]; add an estimate for anything appended
+    since. If history shrank (compaction/reset) the stored count is stale and
+    we fall back to the pure estimate."""
+    est = context_token_count(messages)
+    last = last_prompt_tokens.get(user_id)
+    if last is None:
+        return est
+    tokens, n = last
+    if len(messages) < n:
+        return est
+    tail = approximate_token_count(json.dumps(messages[n:])) if len(messages) > n else 0
+    return max(est, tokens + tail)
 
 
 def _safe_to_write(session_id: SessionID, messages: list[Message]) -> bool:
