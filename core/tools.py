@@ -60,7 +60,7 @@ def is_safe(cmd: str) -> tuple[bool, str | None]:
     return True, None
 
 
-async def run_bash(command: str, allow_unsafe_commands: bool = False) -> str:
+async def run_bash(command: str, bash_timeout_seconds=30, allow_unsafe_commands: bool = False) -> str:
     """Run a shell command and return its output.
     - Do not allow unsafe commands unless specifically granted permission.
     - Only if you have got explicit consent from the user, use `allow_unsafe_commands=True`
@@ -87,7 +87,7 @@ async def run_bash(command: str, allow_unsafe_commands: bool = False) -> str:
             stdin=asyncio.subprocess.DEVNULL,
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=bash_timeout_seconds)
         except (asyncio.TimeoutError, TimeoutError):
             proc.kill()
             await proc.wait()
