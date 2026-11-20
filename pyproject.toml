@@ -19,4 +19,7 @@ selenicode = "main:cli"
 
 [tool.setuptools]
 py-modules = ["main"]
-packages = ["core", "clients"]
+packages = ["core", "clients", "assets"]
+
+[tool.setuptools.package-data]
+assets = ["*.txt"]

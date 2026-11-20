@@ -200,7 +200,7 @@ class TestAsyncMainHistory(unittest.TestCase):
             main, "wait_for_context_size", fake_ctx
         ), mock.patch.object(
             main, "read_conversation", lambda sid: [{"role": "user", "content": "hi"}]
-        ):
+        ), mock.patch.object(main, "_load_logo", lambda: "LOGO"):
             asyncio.run(main.async_main(client_type, session_id))
 
         events = []
@@ -219,6 +219,12 @@ class TestAsyncMainHistory(unittest.TestCase):
         self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
         events = self._run_async_main("terminal", None)
         self.assertFalse(any(isinstance(e, bus_mod.History) for e in events))
+
+    def test_logo_posted_for_fresh_terminal_session(self):
+        events = self._run_async_main("terminal", None)
+        logos = [e for e in events if isinstance(e, bus_mod.Logo)]
+        self.assertEqual(len(logos), 1)
+        self.assertEqual(logos[0].text, "LOGO")
 
 
 class TestSessionWipeGuard(unittest.TestCase):

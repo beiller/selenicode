@@ -45,6 +45,7 @@ from core.bus import (
     Error,
     History,
     Interrupt,
+    Logo,
     ServerStatus,
     Shutdown,
     Token,
@@ -530,6 +531,78 @@ def _tool_call_lines(name: str, args: dict) -> list[list[tuple[str, int]]] | Non
     return [[(header, STY_TOOL)]] + [[seg] for seg in body]
 
 
+_SGR_RE = re.compile(r"\x1b\[38;2;(\d+);(\d+);(\d+)m|\x1b\[39m")
+_LOGO_COLORS: dict[tuple[int, int, int], int] = {}
+
+
+def _xterm256() -> list[tuple[int, int, int]]:
+    base = [
+        (0, 0, 0), (170, 0, 0), (0, 170, 0), (170, 85, 0), (0, 0, 170), (170, 0, 170),
+        (0, 170, 170), (170, 170, 170), (85, 85, 85), (255, 85, 85), (85, 255, 85),
+        (255, 255, 85), (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+    ]
+    levels = (0, 95, 135, 175, 215, 255)
+    cube = [(r, g, b) for r in levels for g in levels for b in levels]
+    gray = [(v, v, v) for v in range(8, 248, 10)]
+    return base + cube + gray
+
+
+_XTERM256 = _xterm256()
+
+
+def _nearest_256(r: int, g: int, b: int) -> int:
+    best, bd = 0, None
+    for i, (pr, pg, pb) in enumerate(_XTERM256):
+        d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
+        if bd is None or d < bd:
+            best, bd = i, d
+    return best
+
+
+def _logo_color_style(r: int, g: int, b: int) -> int | None:
+    """Map a truecolor RGB to a curses style, allocating color pairs on demand.
+
+    ncurses init_pair takes palette indices (not RGB components), so quantize
+    to the nearest xterm-256 color; 16-color terminals degrade gracefully."""
+    key = (r, g, b)
+    style = _LOGO_COLORS.get(key)
+    if style is not None:
+        return style
+    try:
+        pid = 7 + len(_LOGO_COLORS)
+        if pid > 255:
+            return None
+        idx = _nearest_256(r, g, b)
+        curses.init_pair(pid, idx, -1)
+        style = curses.color_pair(pid)
+        _LOGO_COLORS[key] = style
+        if len(_LOGO_COLORS) <= 4:
+            logger.info(f"logo color pair {pid}: rgb{key} -> palette {idx}")
+    except Exception as e:
+        logger.warning(f"logo color allocation failed for {key}: {e!r}")
+        return None
+    return style
+
+
+def _logo_color_runs(line: str, default_style: int) -> list[tuple[str, int]]:
+    """Split a logo line carrying truecolor SGR runs into (text, style) segments."""
+    runs: list[tuple[str, int]] = []
+    cur = default_style
+    start = 0
+    for m in _SGR_RE.finditer(line):
+        if m.start() > start:
+            runs.append((line[start:m.start()], cur))
+        if m.group(1) is not None:
+            s = _logo_color_style(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            cur = default_style if s is None else s
+        else:
+            cur = default_style
+        start = m.end()
+    if start < len(line):
+        runs.append((line[start:], cur))
+    return runs or [("", default_style)]
+
+
 def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[str, int]]]:
     """Wrapped, styled lines for a block; finalized blocks are cached per
     (block, width). The active block is never cached: its raw text grows on
@@ -542,7 +615,18 @@ def _block_lines(state: UIState, block: Block, width: int) -> list[list[tuple[st
         if cached is not None and cached[0] == (width, state.show_thinking):
             return cached[1]
     lines: list[list[tuple[str, int]]] = []
-    if block.role == "thinking" and not state.show_thinking:
+    if block.role == "logo":
+        # ASCII/braille art: never wrap (it would break the art); center the
+        # whole block so per-line padding keeps the art's internal alignment.
+        art = [ln.rstrip() for ln in block.raw.split("\n")]
+        avail = max(1, width - 1)
+        pad = max(0, (avail - max(len(_SGR_RE.sub("", ln)) for ln in art)) // 2)
+        for ln in art:
+            if "\x1b[" in ln:  # truecolor runs (braille logo)
+                lines.append([(" " * pad, block.style)] + _logo_color_runs(ln, block.style))
+            else:
+                lines.append([(" " * pad + ln, block.style)])
+    elif block.role == "thinking" and not state.show_thinking:
         # Collapsed placeholder: char count + first 100 chars (whitespace
         # collapsed) so hidden thinking is visible at a glance.
         preview = " ".join(block.raw.split())
@@ -1088,6 +1172,9 @@ def apply_event(state: UIState, event) -> None:
         case History(messages):
             for block in blocks_from_history(messages):
                 state.blocks.append(block)
+        case Logo(text):
+            logger.info(f"Logo block added: {len(text.splitlines())} rows")
+            state.blocks.insert(0, Block("logo", "", text, STY_DIM))
 
 
 # ---------------------------------------------------------------------------
@@ -1119,6 +1206,7 @@ def _curses_setup() -> "curses._CursesWindow":
     stdscr = curses.initscr()
     try:
         curses.start_color()
+        logger.info(f"curses colors: has_colors={curses.has_colors()} COLORS={curses.COLORS}")
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_CYAN, -1)
         curses.init_pair(2, curses.COLOR_MAGENTA, -1)
@@ -1388,7 +1476,9 @@ def _draw_row_sel(stdscr, r: int, row: list[tuple[str, int]], width: int, c1: in
     for text, style in row:
         if col >= width - 1 or not text:
             continue
-        base = _STYLE_ATTRS.get(style, 0)
+        # STY_* ids map to attrs; anything else (dynamic logo color styles) is
+        # already a curses attr value and passes through.
+        base = _STYLE_ATTRS.get(style, style)
         i = 0
         while i < len(text):
             wch = 2 if unicodedata.east_asian_width(text[i]) in ("W", "F") else 1
@@ -1433,7 +1523,7 @@ def _render(stdscr, state: UIState) -> None:
             if col >= width - 1 or not text:
                 continue
             try:
-                stdscr.addnstr(r, col, text, (width - 1) - col, _STYLE_ATTRS.get(style, 0))
+                stdscr.addnstr(r, col, text, (width - 1) - col, _STYLE_ATTRS.get(style, style))
             except curses.error:
                 break
             col += _cell_len(text)

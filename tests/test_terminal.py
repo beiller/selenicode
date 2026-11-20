@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import clients.terminal as t2
-from core.bus import CompactionDone, Error, History, ServerStatus, Token, TurnDone, UsageReport
+from core.bus import CompactionDone, Error, History, Logo, ServerStatus, Token, TurnDone, UsageReport
 
 
 def fill(state: t2.UIState, n: int) -> None:
@@ -264,6 +264,18 @@ class TestApplyEvent(unittest.TestCase):
         state.tokens = 400
         status_line = t2.render_frame(state, height=5, width=80)[-2][0][0]
         self.assertIn("tokens: 400/1600 (25%)", status_line)
+
+
+class TestLogo(unittest.TestCase):
+    def test_logo_centered_with_internal_alignment_kept(self):
+        art = "  AAA  \nBB\n  CCC"
+        state = t2.UIState(context_size=100)
+        t2.apply_event(state, Logo(art))
+        self.assertEqual(state.blocks[0].role, "logo")
+        lines = [seg[0] for row in t2._block_lines(state, state.blocks[0], 20) for seg in row]
+        # art box is 5 cols wide (after rstrip); centered in 19 usable cells -> pad 7,
+        # plus each line's own indent, so internal alignment is preserved
+        self.assertEqual(lines, [" " * 7 + "  AAA", " " * 7 + "BB", " " * 7 + "  CCC"])
 
 
 class TestInputDecoder(unittest.TestCase):

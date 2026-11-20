@@ -65,6 +65,13 @@ class History:
 
 
 @dataclass(frozen=True)
+class Logo:
+    """Outbound: startup banner text shown when a session has no messages (terminal only)."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class ServerStatus:
     """Outbound: model-server connectivity state (drives the terminal status line)."""
 
@@ -88,6 +95,7 @@ Event = (
     | UsageReport
     | Error
     | History
+    | Logo
     | ServerStatus
     | CompactionDone
 )

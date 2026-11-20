@@ -248,6 +248,7 @@ from core.bus import (
     Error,
     History,
     Interrupt,
+    Logo,
     ServerStatus,
     Shutdown,
     Token,
@@ -407,6 +408,14 @@ ROOT_DIR = config.ROOT_DIR
 SYSTEM_MD = ROOT_DIR / "SYSTEM.md"
 SKILLS_DIR = ROOT_DIR / "skills"
 LOCAL_SKILLS_DIR = ROOT_DIR / "local_skills"
+LOGO_FILE = ROOT_DIR / "assets" / "logo.txt"
+
+
+def _load_logo() -> str | None:
+    try:
+        return LOGO_FILE.read_text().rstrip("\n")
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1020,11 +1029,22 @@ async def async_main(client_type: str, session_id: str | None = None) -> None:
 
     bus.bind()
 
-    if resume and client_type == "terminal":
-        try:
-            bus.outbound.put_nowait(History(read_conversation(session_id)))
-        except (OSError, ValueError) as e:
-            logger.warning(f"Could not load history for session {session_id}: {e}")
+    if client_type == "terminal":
+        messages = []
+        if resume:
+            try:
+                messages = read_conversation(session_id)
+            except (OSError, ValueError) as e:
+                logger.warning(f"Could not load history for session {session_id}: {e}")
+        if messages:
+            bus.outbound.put_nowait(History(messages))
+        else:
+            logo = _load_logo()
+            if logo:
+                logger.info(f"Posting startup logo: {len(logo.splitlines())} rows, {len(logo)} chars")
+                bus.outbound.put_nowait(Logo(logo))
+            else:
+                logger.warning("Startup logo not loaded")
 
     # Server-dependent work runs in the background; the UI comes up immediately.
     load_task = asyncio.create_task(startup_load_model())
